@@ -12,6 +12,8 @@
 //! - The decoded PCM has non-zero RMS (DSP pipeline is producing audio,
 //!   not silence).
 
+mod common;
+
 use oxideav_ac3::audblk::{self, BLOCKS_PER_FRAME};
 use oxideav_ac3::{bsi, decoder::SAMPLES_PER_FRAME, syncinfo};
 use oxideav_core::CodecRegistry;
@@ -71,15 +73,16 @@ fn decoder_produces_frames_of_correct_shape() {
         dec.send_packet(&pkt).unwrap();
         match dec.receive_frame() {
             Ok(Frame::Audio(a)) => {
-                // Per-frame channels / sample_rate are no longer carried
-                // on AudioFrame. Sample-count and the implicit interleaved
-                // stereo (S16) layout are checked indirectly by the
-                // produced byte count.
+                // Per-frame channels / sample_rate are not carried on
+                // AudioFrame: stereo planar float shows as two planes of
+                // four bytes per sample.
                 assert_eq!(a.samples, SAMPLES_PER_FRAME);
-                assert_eq!(
-                    a.data[0].len(),
-                    SAMPLES_PER_FRAME as usize * 2 * 2,
-                    "expected stereo S16 interleaved output"
+                assert_eq!(a.data.len(), 2, "expected two planes");
+                assert!(
+                    a.data
+                        .iter()
+                        .all(|p| p.len() == SAMPLES_PER_FRAME as usize * 4),
+                    "expected planar f32 output"
                 );
                 produced += 1;
             }
@@ -177,7 +180,7 @@ fn decoder_sine_fixture_has_nonzero_rms() {
             .with_pts(frame_idx * SAMPLES_PER_FRAME as i64);
         dec.send_packet(&pkt).unwrap();
         if let Ok(Frame::Audio(a)) = dec.receive_frame() {
-            let buf = &a.data[0];
+            let buf = &common::s16_interleaved(&a);
             for s in buf.chunks_exact(4) {
                 let l = i16::from_le_bytes([s[0], s[1]]);
                 let r = i16::from_le_bytes([s[2], s[3]]);
@@ -277,7 +280,7 @@ fn decoder_matches_ffmpeg_within_psnr_floor() {
         .with_pts(frame_idx * SAMPLES_PER_FRAME as i64);
         dec.send_packet(&pkt).unwrap();
         if let Ok(Frame::Audio(a)) = dec.receive_frame() {
-            our_pcm.extend_from_slice(&a.data[0]);
+            our_pcm.extend_from_slice(&common::s16_interleaved(&a));
         }
         offset += flen;
         frame_idx += 1;
@@ -429,7 +432,7 @@ fn transient_fixture_has_short_blocks() {
         .with_pts(frame_idx * SAMPLES_PER_FRAME as i64);
         dec.send_packet(&pkt).unwrap();
         if let Ok(Frame::Audio(a)) = dec.receive_frame() {
-            for s in a.data[0].chunks_exact(2) {
+            for s in common::s16_interleaved(&a).chunks_exact(2) {
                 decoded.push(i16::from_le_bytes([s[0], s[1]]));
             }
         }
@@ -562,7 +565,7 @@ fn decoder_matches_ffmpeg_on_transient_fixture() {
         .with_pts(frame_idx * SAMPLES_PER_FRAME as i64);
         dec.send_packet(&pkt).unwrap();
         if let Ok(Frame::Audio(a)) = dec.receive_frame() {
-            our_pcm.extend_from_slice(&a.data[0]);
+            our_pcm.extend_from_slice(&common::s16_interleaved(&a));
         }
         offset += flen;
         frame_idx += 1;

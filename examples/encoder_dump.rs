@@ -51,13 +51,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for pk in &packets {
         dec.send_packet(pk)?;
         if let Ok(Frame::Audio(a)) = dec.receive_frame() {
-            let plane = &a.data[0];
-            for c in plane.chunks_exact(4) {
-                let off = ch * 2;
-                let li = i16::from_le_bytes([c[off], c[off + 1]]);
-                let f = li as f32 / 32768.0;
-                out.write_all(&f.to_le_bytes())?;
-            }
+            // planar float: channel `ch`'s plane is already f32 LE
+            out.write_all(&a.data[ch])?;
         }
     }
     Ok(())

@@ -139,13 +139,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for p in &packets {
         dec.send_packet(p)?;
         if let Ok(Frame::Audio(a)) = dec.receive_frame() {
-            let plane = &a.data[0];
-            for c in plane.chunks_exact(4) {
-                let li = i16::from_le_bytes([c[0], c[1]]) as f32 / 32768.0;
-                let ri = i16::from_le_bytes([c[2], c[3]]) as f32 / 32768.0;
-                dec_l.push(li);
-                dec_r.push(ri);
-            }
+            // planar float: plane 0 is L, plane 1 is R
+            let plane = |i: usize| {
+                a.data[i]
+                    .chunks_exact(4)
+                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            };
+            dec_l.extend(plane(0));
+            dec_r.extend(plane(1));
         }
     }
     eprintln!("decoded {} samples", dec_l.len());

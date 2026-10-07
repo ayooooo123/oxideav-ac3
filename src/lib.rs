@@ -64,6 +64,9 @@ pub mod downmix;
 pub mod drc;
 pub mod eac3;
 pub mod encoder;
+// FFmpeg's float AC-3 / E-AC-3 decoder, ported (LGPL-2.1-or-later): what
+// `decoder::make_decoder` / `make_eac3_decoder` return.
+mod ffdec;
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub mod imdct;
@@ -145,11 +148,11 @@ pub fn register_codecs(reg: &mut CodecRegistry) {
     // fractional syncframes (`blocks` option), and §3.7 TPNP
     // emission (`tpnp` option).
     //
-    // Decoder side: full Annex E DSP — §3.4 Adaptive Hybrid
-    // Transform on fbw / LFE / coupling channels, §3.6 spectral
-    // extension with §3.6.4.2.3 SPXATTEN border notch, §3.7.2
-    // transient pre-noise processing, and §7.8 LoRo / LtRt downmix
-    // including mixmdata mix-level routing.
+    // Decoder side: the FFmpeg port (`ffdec`) — AHT, spectral extension
+    // and dependent substreams as FFmpeg 2da55bf decodes them, planar
+    // float in FFmpeg's channel order. The native decoder (§3.7.2
+    // transient pre-noise processing, §7.8 LoRo / LtRt downmix) is reached
+    // through the `decoder` module's opt-in factories.
     let eac3_cid = CodecId::new(CODEC_ID_STR_EAC3);
     let eac3_dec_caps = CodecCapabilities::audio("eac3_sw_dec")
         .with_lossy(true)

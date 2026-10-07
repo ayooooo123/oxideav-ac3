@@ -3,7 +3,7 @@
 //!
 //! Generates a 5.1 AC-3 bitstream (per the canonical `downmix_51`
 //! pattern), then decodes it twice from our crate: once through
-//! `make_decoder` (LoRo) and once through `make_decoder_ltrt` (LtRt).
+//! `make_native_decoder` (LoRo) and once through `make_decoder_ltrt` (LtRt).
 //! The test asserts the matrix encoder's defining behaviour — when only
 //! the surround channels carry signal, LtRt's Lt and Rt must be largely
 //! out-of-phase, while LoRo's Lt and Rt are in-phase. We measure
@@ -15,7 +15,7 @@
 
 use std::process::Command;
 
-use oxideav_ac3::decoder::{make_decoder, make_decoder_ltrt};
+use oxideav_ac3::decoder::{make_decoder_ltrt, make_native_decoder};
 use oxideav_core::{CodecId, CodecParameters, Frame, Packet, TimeBase};
 
 /// Surround-only test content: pure tones on Ls and Rs (mid + back-mid
@@ -194,7 +194,7 @@ fn ltrt_surround_only_inverts_phase_vs_loro() {
         return;
     }
 
-    let (ch_loro, loro_pcm) = decode_with(&bitstream, make_decoder);
+    let (ch_loro, loro_pcm) = decode_with(&bitstream, make_native_decoder);
     let (ch_ltrt, ltrt_pcm) = decode_with(&bitstream, make_decoder_ltrt);
     assert_eq!(ch_loro, 2, "LoRo factory did not produce stereo");
     assert_eq!(ch_ltrt, 2, "LtRt factory did not produce stereo");
@@ -258,7 +258,7 @@ fn ltrt_matches_loro_when_no_surround_content() {
     };
     let _ = std::fs::remove_file(&tmp);
 
-    let (_, loro_pcm) = decode_with(&bitstream, make_decoder);
+    let (_, loro_pcm) = decode_with(&bitstream, make_native_decoder);
     let (_, ltrt_pcm) = decode_with(&bitstream, make_decoder_ltrt);
     // Trim to common length.
     let n = loro_pcm.len().min(ltrt_pcm.len());

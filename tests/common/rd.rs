@@ -782,7 +782,8 @@ fn split_packets(es: &[u8], codec: Codec) -> Vec<Vec<u8>> {
     packets
 }
 
-/// Decode with our registry decoder to WAV-order f32.
+/// Decode with our registry decoder (planar float, FFmpeg's channel order,
+/// which matches WAV order for these layouts) to interleaved f32.
 pub fn decode_ours(es: &[u8], codec: Codec, channels: usize) -> Vec<f32> {
     let mut reg = CodecRegistry::new();
     oxideav_ac3::register_codecs(&mut reg);
@@ -796,13 +797,20 @@ pub fn decode_ours(es: &[u8], codec: Codec, channels: usize) -> Vec<f32> {
         loop {
             match dec.receive_frame() {
                 Ok(Frame::Audio(a)) => {
-                    assert_eq!(
-                        a.data[0].len(),
-                        a.samples as usize * channels * 2,
-                        "decoder channel count mismatch"
-                    );
+                    assert_eq!(a.data.len(), channels, "decoder channel count mismatch");
                     pts += a.samples as i64;
-                    out.extend(s16_to_f32(&a.data[0]));
+                    let planes: Vec<Vec<f32>> = a
+                        .data
+                        .iter()
+                        .map(|p| {
+                            p.chunks_exact(4)
+                                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                                .collect()
+                        })
+                        .collect();
+                    for i in 0..a.samples as usize {
+                        out.extend(planes.iter().map(|p| p[i]));
+                    }
                 }
                 Ok(_) => {}
                 Err(Error::NeedMore) | Err(Error::Eof) => break,

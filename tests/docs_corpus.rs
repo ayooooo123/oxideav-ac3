@@ -38,6 +38,8 @@
 //! fixtures are missing the test logs `skip <name>: missing ...` and
 //! returns success, so CI stays clean for both layouts.
 
+mod common;
+
 use std::fs;
 use std::path::PathBuf;
 
@@ -398,18 +400,14 @@ fn decode_stream(input: &[u8]) -> DecodedPcm {
         }
         match dec.receive_frame() {
             Ok(Frame::Audio(af)) => {
-                // af.data[0] is interleaved S16LE bytes.
-                let plane = &af.data[0];
-                let n = plane.len() / 2;
+                // planar float; scored as FFmpeg's s16 conversion of it
+                let pcm = common::s16_interleaved(&af);
+                let n = pcm.len() / 2;
                 if channels == 0 && af.samples > 0 {
-                    // Channels = total samples / per-channel samples.
-                    let per_ch = af.samples as usize;
-                    if let Some(c) = n.checked_div(per_ch) {
-                        channels = c as u16;
-                    }
+                    channels = af.data.len() as u16;
                 }
                 samples.reserve(n);
-                for chunk in plane.chunks_exact(2) {
+                for chunk in pcm.chunks_exact(2) {
                     samples.push(i16::from_le_bytes([chunk[0], chunk[1]]));
                 }
                 frames_ok += 1;

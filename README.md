@@ -41,7 +41,29 @@ slice of §5..§7 (base AC-3) or §E (E-AC-3):
 
 ## Capabilities
 
-### AC-3 decoder
+### Default decoder: FFmpeg's, ported
+
+The decoder the codec registry installs for `"ac3"` and `"eac3"`
+(`decoder::make_decoder` / `make_eac3_decoder`) is a port of FFmpeg's
+float AC-3 / E-AC-3 decoder at commit 2da55bf (`libavcodec/ac3dec.c`,
+`eac3dec.c`, their tables and DSP; `src/ffdec`, LGPL-2.1-or-later). For the
+packets FFmpeg's demuxer gives its own decoder it emits FFmpeg's frames:
+the same count and sizes, the same channel layout and order, planar
+`F32P` reported through `Decoder::output_audio_format`, and samples
+within 139-140 dB SNR of FFmpeg's C code paths (`-cpuflags 0`) on every
+FATE `ac3/` and `eac3/` stream. That includes FFmpeg's dither and
+spectral-extension noise (its `AVLFG` seeded with 0), concealment of a cut
+or undecodable frame (the previous frame's last block, repeated), packets
+holding several frames, and E-AC-3 dependent substreams (7.1). Not ported:
+the decoder options `downmix`, `drc_scale`, `heavy_compr`, `target_level`
+and `cons_noisegen` (their defaults are what runs).
+
+### Native AC-3 decoder
+
+The crate's own decoder stays behind the opt-in factories
+(`decoder::make_native_decoder`, `make_decoder_ltrt`,
+`make_decoder_with_drc`, `make_eac3_decoder_with_joc`): interleaved S16,
+downmixed to the container's channel count. What it covers:
 
 - Sync frame + BSI parse (§5.3 / §5.4). All §5.4.2 metadata words —
   bit-stream mode, compression gain, dialogue normalisation, mix
@@ -557,9 +579,11 @@ oxideav-ac3 = "0.0"
 
 ## Codec ID
 
-- Codecs: `"ac3"` (decoder + encoder) and `"eac3"` (decoder + encoder);
-  output sample format `S16` interleaved.
+- Codecs: `"ac3"` (decoder + encoder) and `"eac3"` (decoder + encoder).
+  The registered decoder outputs planar `F32P` in FFmpeg's channel order;
+  the native decoder's factories output `S16` interleaved.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT — see [LICENSE](LICENSE) — except `src/ffdec`, a port of FFmpeg's
+decoder: LGPL-2.1-or-later — see [LICENSE-LGPL](LICENSE-LGPL).

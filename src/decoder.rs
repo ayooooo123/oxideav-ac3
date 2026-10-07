@@ -1,11 +1,18 @@
-//! AC-3 packet → AudioFrame decoder.
+//! AC-3 / E-AC-3 packet → AudioFrame decoders.
 //!
-//! The decoder runs the full §7 DSP pipeline: syncinfo + BSI parsing,
-//! audio-block exponent decode, parametric bit allocation, mantissa
-//! dequantization, channel decoupling, rematrixing (for 2/0 streams),
-//! dynamic-range scaling, 512-point IMDCT with KBD window, and 50%
-//! overlap-add across audio blocks. The per-frame output is 1536 S16
-//! samples per channel exactly as specified by §8.2.1.2.
+//! [`make_decoder`] and [`make_eac3_decoder`] (the factories the codec
+//! registry installs) return the port of FFmpeg's float decoder: planar
+//! `F32P` frames in FFmpeg's channel order, sample for sample FFmpeg
+//! 2da55bf's output, layout reported through
+//! `Decoder::output_audio_format`.
+//!
+//! The opt-in factories ([`make_decoder_ltrt`], [`make_decoder_with_drc`],
+//! [`make_eac3_decoder_with_joc`]) keep the crate's native decoder for
+//! the features they select: it runs the §7 DSP pipeline (syncinfo + BSI
+//! parsing, exponent decode, parametric bit allocation, mantissa
+//! dequantization, decoupling, rematrixing, dynamic-range scaling, IMDCT
+//! with KBD window and overlap-add) and emits 1536 interleaved S16 samples
+//! per channel and syncframe, downmixed to the container's channel count.
 
 use oxideav_core::Decoder;
 use oxideav_core::{
@@ -29,27 +36,26 @@ use crate::wave_order;
 #[doc(hidden)]
 pub const SAMPLES_PER_FRAME: u32 = 1536;
 
+/// The AC-3 decoder: FFmpeg's (see the module docs). Decodes E-AC-3
+/// frames too, as FFmpeg's `ac3` decoder does.
 pub fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
-    Ok(Box::new(Ac3Decoder {
-        codec_id: params.codec_id.clone(),
-        time_base: TimeBase::new(1, 48_000),
-        pending: None,
-        eof: false,
-        state: Ac3State::new(),
-        eac3_state: eac3::Eac3DecoderState::default(),
-        requested_channels: params.channels,
-        prefer_ltrt: false,
-        drc: DrcSettings::default(),
-        render_joc_stereo: false,
-        joc_renderer: JocRenderer::default(),
-    }))
+    Ok(Box::new(crate::ffdec::FfAc3Decoder::new(params)))
 }
 
-/// Dedicated E-AC-3 decoder factory. Identical to [`make_decoder`] —
-/// the same `Ac3Decoder` struct dispatches on the per-packet bsid —
-/// but registered with the `eac3` codec id so the registry's
-/// container-tag lookup hits it for `A_EAC3` / `0xA7` / etc.
+/// The E-AC-3 decoder: the same decoder as [`make_decoder`], registered
+/// under the `eac3` codec id so the registry's container-tag lookup hits
+/// it for `A_EAC3` / `0xA7` / etc.
 pub fn make_eac3_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
+    Ok(Box::new(crate::ffdec::FfAc3Decoder::new(params)))
+}
+
+/// The crate's native decoder with its defaults: interleaved S16 in WAV
+/// order, downmixed (LoRo) to the container's channel count when it asks
+/// for fewer channels. The factories below configure it further (LtRt,
+/// DRC, JOC rendering).
+// internal — exposed for tests/fuzz; not part of the stable API
+#[doc(hidden)]
+pub fn make_native_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
     Ok(Box::new(Ac3Decoder {
         codec_id: params.codec_id.clone(),
         time_base: TimeBase::new(1, 48_000),
@@ -65,14 +71,13 @@ pub fn make_eac3_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
     }))
 }
 
-/// Build an E-AC-3 decoder that prefers the reconstructed JOC object
+/// Build a native E-AC-3 decoder that prefers the reconstructed JOC object
 /// presentation when the caller requests stereo output.
 ///
 /// Validated 5.X JOC/OAMD frames are rendered with the crate's reference
 /// stereo-speaker policy. Non-JOC streams and malformed, incomplete, or
 /// unsupported JOC presentations fall back to the same §7.8 compatibility
-/// downmix used by [`make_eac3_decoder`]. Existing factories deliberately
-/// keep their historical channel-presentation behaviour.
+/// downmix [`make_native_decoder`] applies.
 pub fn make_eac3_decoder_with_joc(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
     Ok(Box::new(Ac3Decoder {
         codec_id: params.codec_id.clone(),
@@ -89,9 +94,9 @@ pub fn make_eac3_decoder_with_joc(params: &CodecParameters) -> Result<Box<dyn De
     }))
 }
 
-/// Variant of [`make_decoder`] that selects the §7.8.2 **LtRt**
+/// Variant of [`make_native_decoder`] that selects the §7.8.2 **LtRt**
 /// (Dolby Surround matrix-encoded) downmix when a 2-channel target is
-/// requested. Equivalent to `make_decoder` when the caller did not
+/// requested. Equivalent to `make_native_decoder` when the caller did not
 /// request a stereo downmix (`params.channels != Some(2)` or the
 /// source is already mono/stereo). The LtRt downmix preserves
 /// surround information so a downstream matrix decoder (Pro Logic
@@ -115,10 +120,10 @@ pub fn make_decoder_ltrt(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
     }))
 }
 
-/// Build an AC-3 / E-AC-3 decoder with an explicit §6.1.9 / §7.7 dynamic-
-/// range-control + §7.6 dialogue-normalisation configuration (see
-/// [`crate::drc::DrcSettings`]). Equivalent to [`make_decoder`] followed
-/// by [`Ac3Decoder::set_drc`], but returns the boxed trait object directly
+/// Build a native AC-3 / E-AC-3 decoder with an explicit §6.1.9 / §7.7
+/// dynamic-range-control + §7.6 dialogue-normalisation configuration (see
+/// [`crate::drc::DrcSettings`]). Equivalent to [`make_native_decoder`]
+/// followed by [`Ac3Decoder::set_drc`], but returns the boxed trait object directly
 /// so a registry consumer can request, e.g., heavy-compression "RF mode"
 /// output without down-casting.
 ///
@@ -771,7 +776,7 @@ mod tests {
         dec_params.sample_rate = Some(48_000);
         dec_params.channels = Some(2);
         dec_params.sample_format = Some(SampleFormat::S16);
-        let mut dec = make_eac3_decoder(&dec_params).expect("make_eac3_decoder");
+        let mut dec = make_native_decoder(&dec_params).expect("make_native_decoder");
         let mut joc_dec =
             make_eac3_decoder_with_joc(&dec_params).expect("make_eac3_decoder_with_joc");
 

@@ -11,8 +11,8 @@
 
 use std::process::Command;
 
+use oxideav_ac3::decoder::make_native_decoder;
 use oxideav_ac3::downmix::{Downmix, DownmixMode};
-use oxideav_core::CodecRegistry;
 use oxideav_core::{CodecId, CodecParameters, Frame, Packet, TimeBase};
 
 /// Test content: 0.5 s stereo sine burst mixed against a quiet pink
@@ -32,11 +32,11 @@ fn ffmpeg_available() -> bool {
 }
 
 fn decode_ac3_fully(data: &[u8], target_channels: Option<u16>) -> (u16, Vec<i16>) {
-    let mut reg = CodecRegistry::new();
-    oxideav_ac3::register_codecs(&mut reg);
+    // The native decoder downmixes to the requested channel count (the
+    // default decoder, FFmpeg's, keeps the stream's channels).
     let mut params = CodecParameters::audio(CodecId::new("ac3"));
     params.channels = target_channels;
-    let mut dec = reg.first_decoder(&params).expect("make_decoder");
+    let mut dec = make_native_decoder(&params).expect("make_native_decoder");
 
     let mut offset = 0;
     let mut pcm: Vec<i16> = Vec::new();

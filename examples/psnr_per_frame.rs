@@ -10,6 +10,26 @@ use oxideav_ac3::{bsi, decoder::SAMPLES_PER_FRAME, syncinfo};
 use oxideav_core::CodecRegistry;
 use oxideav_core::{CodecId, CodecParameters, Frame, Packet, TimeBase};
 
+/// A decoded frame (planar float) as interleaved S16LE, converted as
+/// FFmpeg's `flt` → `s16` does.
+fn s16_interleaved(a: &oxideav_core::AudioFrame) -> Vec<u8> {
+    let planes: Vec<Vec<f32>> = a
+        .data
+        .iter()
+        .map(|p| {
+            p.chunks_exact(4)
+                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                .collect()
+        })
+        .collect();
+    (0..a.samples as usize)
+        .flat_map(|i| planes.iter().map(move |p| p[i]))
+        .flat_map(|s| {
+            ((s * 32768.0).round_ties_even().clamp(-32768.0, 32767.0) as i16).to_le_bytes()
+        })
+        .collect()
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let path = env::args()
         .nth(1)
@@ -51,7 +71,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_pts(frame_idx * SAMPLES_PER_FRAME as i64);
         dec.send_packet(&pkt)?;
         if let Ok(Frame::Audio(a)) = dec.receive_frame() {
-            our_pcm.extend_from_slice(&a.data[0]);
+            our_pcm.extend_from_slice(&s16_interleaved(&a));
         }
         offset += flen;
         frame_idx += 1;

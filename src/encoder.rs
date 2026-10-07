@@ -5385,7 +5385,29 @@ fn reconstruct_cplco(cplcoexp: u8, cplcomant: u8, mstrcplco: u8) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use oxideav_core::{CodecId, CodecParameters, SampleFormat};
+    use oxideav_core::{AudioFrame, CodecId, CodecParameters, SampleFormat};
+
+    /// A decoded frame (planar float, as `make_decoder` emits it) as
+    /// interleaved S16LE, converted as FFmpeg's `flt` → `s16` does.
+    fn s16_interleaved(a: &AudioFrame) -> Vec<u8> {
+        let planes: Vec<Vec<f32>> = a
+            .data
+            .iter()
+            .map(|p| {
+                p.chunks_exact(4)
+                    .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                    .collect()
+            })
+            .collect();
+        let mut out = Vec::with_capacity(a.samples as usize * planes.len() * 2);
+        for i in 0..a.samples as usize {
+            for p in &planes {
+                let s = (p[i] * 32768.0).round_ties_even().clamp(-32768.0, 32767.0) as i16;
+                out.extend_from_slice(&s.to_le_bytes());
+            }
+        }
+        out
+    }
 
     /// Walk the decoder's grouped-exponent reconstruction (matches
     /// `audblk::decode_exponents` + grpsize expansion) on the encoder's
@@ -5754,7 +5776,7 @@ mod tests {
             dec.send_packet(p).unwrap();
             match dec.receive_frame() {
                 Ok(Frame::Audio(a)) => {
-                    let plane = &a.data[0];
+                    let plane = &s16_interleaved(&a);
                     for s in plane.chunks_exact(4) {
                         let l = i16::from_le_bytes([s[0], s[1]]);
                         decoded_samples_left.push(l);
@@ -5965,7 +5987,7 @@ mod tests {
         for p in &pkts {
             dec.send_packet(p).unwrap();
             if let Ok(Frame::Audio(a)) = dec.receive_frame() {
-                for s in a.data[0].chunks_exact(4) {
+                for s in s16_interleaved(&a).chunks_exact(4) {
                     decoded.push(i16::from_le_bytes([s[0], s[1]]));
                 }
             }
@@ -6347,7 +6369,7 @@ mod tests {
         for p in &pkts {
             dec.send_packet(p).unwrap();
             if let Ok(Frame::Audio(a)) = dec.receive_frame() {
-                for s in a.data[0].chunks_exact(4) {
+                for s in s16_interleaved(&a).chunks_exact(4) {
                     decoded.push(i16::from_le_bytes([s[0], s[1]]));
                 }
             }
@@ -6535,7 +6557,7 @@ mod tests {
         for p in &pkts {
             dec.send_packet(p).unwrap();
             if let Ok(Frame::Audio(a)) = dec.receive_frame() {
-                for s in a.data[0].chunks_exact(4) {
+                for s in s16_interleaved(&a).chunks_exact(4) {
                     decoded.push(i16::from_le_bytes([s[0], s[1]]));
                 }
             }
@@ -6730,7 +6752,7 @@ mod tests {
         for p in &pkts {
             dec.send_packet(p).unwrap();
             if let Ok(Frame::Audio(a)) = dec.receive_frame() {
-                for s in a.data[0].chunks_exact(4) {
+                for s in s16_interleaved(&a).chunks_exact(4) {
                     decoded.push(i16::from_le_bytes([s[0], s[1]]));
                 }
             }
@@ -6893,7 +6915,7 @@ mod tests {
         for p in &pkts {
             dec.send_packet(p).unwrap();
             if let Ok(Frame::Audio(a)) = dec.receive_frame() {
-                for s in a.data[0].chunks_exact(2) {
+                for s in s16_interleaved(&a).chunks_exact(2) {
                     decoded.push(i16::from_le_bytes([s[0], s[1]]));
                 }
             }
@@ -7152,7 +7174,7 @@ mod tests {
         for p in &pkts {
             dec.send_packet(p).unwrap();
             if let Ok(Frame::Audio(a)) = dec.receive_frame() {
-                for s in a.data[0].chunks_exact(2) {
+                for s in s16_interleaved(&a).chunks_exact(2) {
                     decoded.push(i16::from_le_bytes([s[0], s[1]]));
                 }
             }
@@ -7305,7 +7327,7 @@ mod tests {
         for p in &pkts {
             dec.send_packet(p).unwrap();
             if let Ok(Frame::Audio(a)) = dec.receive_frame() {
-                for s in a.data[0].chunks_exact(2) {
+                for s in s16_interleaved(&a).chunks_exact(2) {
                     decoded.push(i16::from_le_bytes([s[0], s[1]]));
                 }
             }
@@ -7816,7 +7838,7 @@ mod tests {
                 );
                 dec.send_packet(&pkt).unwrap();
                 if let Ok(Frame::Audio(a)) = dec.receive_frame() {
-                    for s in a.data[0].chunks_exact(2) {
+                    for s in s16_interleaved(&a).chunks_exact(2) {
                         decoded.push(i16::from_le_bytes([s[0], s[1]]));
                     }
                 }
@@ -8011,7 +8033,7 @@ mod tests {
         for p in &pkts {
             dec.send_packet(p).unwrap();
             while let Ok(Frame::Audio(a)) = dec.receive_frame() {
-                decoded += a.data[0].len() / 4;
+                decoded += a.samples as usize;
             }
         }
         assert!(
@@ -8082,7 +8104,7 @@ mod tests {
             for p in &pkts {
                 dec.send_packet(p).unwrap();
                 while let Ok(Frame::Audio(a)) = dec.receive_frame() {
-                    for s in a.data[0].chunks_exact(4) {
+                    for s in s16_interleaved(&a).chunks_exact(4) {
                         decoded.push(i16::from_le_bytes([s[0], s[1]]));
                     }
                 }
@@ -8315,7 +8337,7 @@ mod tests {
         for p in pkts {
             dec.send_packet(p).unwrap();
             while let Ok(Frame::Audio(a)) = dec.receive_frame() {
-                for s in a.data[0].chunks_exact(2) {
+                for s in s16_interleaved(&a).chunks_exact(2) {
                     out.push(i16::from_le_bytes([s[0], s[1]]));
                 }
             }
