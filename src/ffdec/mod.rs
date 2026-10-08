@@ -11,8 +11,10 @@
 //! * concealment: a frame cut short (or failing to decode) repeats the
 //!   previous frame's last block, so a stream's cut-off last frame still
 //!   yields a full frame;
-//! * packets carrying several frames: each call decodes one and the rest of
-//!   the packet is fed again, as FFmpeg's decode loop does;
+//! * packets carrying several frames: decoded on demand, one frame per
+//!   `receive_frame` (and one ahead in `send_packet`, as
+//!   `avcodec_send_packet` does), the rest of the packet fed again, as
+//!   FFmpeg's decode loop does, so a packet costs a frame or two of memory;
 //! * E-AC-3 dependent substreams merged into the independent stream's
 //!   channels through the custom channel map.
 //!
@@ -50,10 +52,22 @@ pub(crate) struct FfAc3Decoder {
     codec_id: CodecId,
     container_rate: u32,
     ctx: Box<Ac3Context>,
-    queue: VecDeque<Output>,
+    /// Packets not yet fully decoded.
+    pending: VecDeque<Pending>,
+    /// The output decoded ahead, as `avcodec_send_packet` fills
+    /// `buffer_frame`: at most one.
+    ahead: Option<Output>,
     /// Layout of the frame `receive_frame` returned last.
     returned: Option<AudioFormat>,
     eof: bool,
+}
+
+/// A packet not yet fully decoded: its bytes from `pos` on, and the
+/// timestamp of its first frame until that frame is decoded.
+struct Pending {
+    data: Vec<u8>,
+    pos: usize,
+    pts: Option<i64>,
 }
 
 impl FfAc3Decoder {
@@ -63,10 +77,53 @@ impl FfAc3Decoder {
             codec_id: params.codec_id.clone(),
             container_rate,
             ctx: Box::new(Ac3Context::new(container_rate)),
-            queue: VecDeque::new(),
+            pending: VecDeque::new(),
+            ahead: None,
             returned: None,
             eof: false,
         }
+    }
+
+    /// The next output of the pending packets, as one pass of FFmpeg's
+    /// `decode_simple_receive_frame`: each call consumes what
+    /// `ac3_decode_frame` reports and the rest of the packet is fed again
+    /// without its timestamp; an error drops the rest of the packet.
+    fn decode_next(&mut self) -> Option<Output> {
+        while let Some(packet) = self.pending.front_mut() {
+            let rest = &packet.data[packet.pos..];
+            let left = rest.len();
+            let pts = packet.pts.take();
+            match self.ctx.decode_frame(rest) {
+                Ok((consumed, frame)) => {
+                    // FFmpeg would feed a packet it consumed nothing of again
+                    // forever; there is nothing more to decode from it.
+                    if consumed == 0 || consumed >= left {
+                        self.pending.pop_front();
+                    } else {
+                        packet.pos += consumed;
+                    }
+                    if let Some(frame) = frame {
+                        let format = AudioFormat {
+                            sample_format: SampleFormat::F32P,
+                            sample_rate: frame.sample_rate,
+                            channels: frame.planes.len() as u16,
+                        };
+                        let samples = frame.planes.first().map_or(0, Vec::len) as u32;
+                        let data = frame
+                            .planes
+                            .iter()
+                            .map(|plane| plane.iter().flat_map(|s| s.to_le_bytes()).collect())
+                            .collect();
+                        return Some(Ok((AudioFrame { samples, pts, data }, format)));
+                    }
+                }
+                Err(e) => {
+                    self.pending.pop_front();
+                    return Some(Err(to_error(e)));
+                }
+            }
+        }
+        None
     }
 }
 
@@ -82,50 +139,26 @@ impl Decoder for FfAc3Decoder {
         &self.codec_id
     }
 
-    /// Decodes every frame of the packet: like FFmpeg's decode loop, each
-    /// call consumes what `ac3_decode_frame` reports and feeds the rest
-    /// again, without the packet's timestamp. A decode error ends the
-    /// packet; it is returned after the frames decoded before it.
+    /// Holds the packet and, as `avcodec_send_packet` does, decodes one
+    /// frame ahead when none is waiting; `receive_frame` decodes the rest,
+    /// one frame per call. A decode error drops the rest of its packet and
+    /// is returned in its turn, after the frames decoded before it.
     fn send_packet(&mut self, packet: &Packet) -> Result<()> {
-        let mut data: &[u8] = &packet.data;
-        let mut pts = packet.pts;
-        while !data.is_empty() {
-            match self.ctx.decode_frame(data) {
-                Ok((consumed, frame)) => {
-                    if let Some(frame) = frame {
-                        let format = AudioFormat {
-                            sample_format: SampleFormat::F32P,
-                            sample_rate: frame.sample_rate,
-                            channels: frame.planes.len() as u16,
-                        };
-                        let samples = frame.planes.first().map_or(0, Vec::len) as u32;
-                        let data = frame
-                            .planes
-                            .iter()
-                            .map(|plane| plane.iter().flat_map(|s| s.to_le_bytes()).collect())
-                            .collect();
-                        self.queue
-                            .push_back(Ok((AudioFrame { samples, pts, data }, format)));
-                    }
-                    pts = None;
-                    // FFmpeg would feed a packet it consumed nothing of again
-                    // forever; there is nothing more to decode from it.
-                    if consumed == 0 || consumed >= data.len() {
-                        break;
-                    }
-                    data = &data[consumed..];
-                }
-                Err(e) => {
-                    self.queue.push_back(Err(to_error(e)));
-                    break;
-                }
-            }
+        if !packet.data.is_empty() {
+            self.pending.push_back(Pending {
+                data: packet.data.clone(),
+                pos: 0,
+                pts: packet.pts,
+            });
+        }
+        if self.ahead.is_none() {
+            self.ahead = self.decode_next();
         }
         Ok(())
     }
 
     fn receive_frame(&mut self) -> Result<Frame> {
-        match self.queue.pop_front() {
+        match self.ahead.take().or_else(|| self.decode_next()) {
             Some(Ok((frame, format))) => {
                 self.returned = Some(format);
                 Ok(Frame::Audio(frame))
@@ -146,20 +179,20 @@ impl Decoder for FfAc3Decoder {
     /// decoder, as `ffmpeg -ss` decodes from a seek point, keeps them.)
     fn reset(&mut self) -> Result<()> {
         *self.ctx = Ac3Context::new(self.container_rate);
-        self.queue.clear();
+        self.pending.clear();
+        self.ahead = None;
         self.returned = None;
         self.eof = false;
         Ok(())
     }
 
     /// The layout of the frame `receive_frame` returned last, or before the
-    /// first, of the next one: planar float at the stream's rate, in
-    /// FFmpeg's channel order.
+    /// first, of the one decoded ahead: planar float at the stream's rate,
+    /// in FFmpeg's channel order.
     fn output_audio_format(&self) -> Option<AudioFormat> {
-        self.returned.or_else(|| {
-            self.queue
-                .iter()
-                .find_map(|o| o.as_ref().ok().map(|(_, f)| *f))
+        self.returned.or(match &self.ahead {
+            Some(Ok((_, format))) => Some(*format),
+            _ => None,
         })
     }
 }
