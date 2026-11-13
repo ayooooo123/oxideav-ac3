@@ -82,7 +82,7 @@ fn symmetric_dequant(code: i32, levels: i32) -> i32 {
     ((code - (levels >> 1)) * (1 << 24)) / levels
 }
 
-static TABLES: LazyLock<StaticTables> = LazyLock::new(build_tables);
+static TABLES: LazyLock<Box<StaticTables>> = LazyLock::new(|| Box::new(build_tables()));
 
 fn tables() -> &'static StaticTables {
     &TABLES
