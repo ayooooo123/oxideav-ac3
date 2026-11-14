@@ -40,11 +40,12 @@
 //! random de-correlation then contributes nothing, keeping the decode
 //! deterministic and the amplitude modification factor at unity.
 
-use super::ecpl::{ampbnd, band_bin_counts, begin_bin, end_bin, EcplCarrier, N_ECPL_SUBBND};
+use super::ecpl::{EcplCarrier, N_ECPL_SUBBND, ampbnd, band_bin_counts, begin_bin, end_bin};
 use crate::audblk::N_COEFFS;
 
 /// Encoder-facing enhanced-coupling parameters (§E.2.3.3.16-17 codes).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct EcplParams {
     /// `ecplbegf` (4 bits) — begin-frequency code, Table E3.8. The
     /// encoder restricts it to `2..=13` (begin sub-band ≥ 4, i.e. the
@@ -65,6 +66,29 @@ pub struct EcplParams {
     /// chaos 0 everywhere (fully correlated model — the decode is then
     /// a deterministic pure amplitude+angle reconstruction).
     pub chaos: bool,
+}
+
+impl EcplParams {
+    /// Builder: set [`ecplbegf`](Self::ecplbegf).
+    #[must_use]
+    pub fn with_ecplbegf(mut self, v: u8) -> Self {
+        self.ecplbegf = v;
+        self
+    }
+
+    /// Builder: set [`ecplendf`](Self::ecplendf).
+    #[must_use]
+    pub fn with_ecplendf(mut self, v: u8) -> Self {
+        self.ecplendf = v;
+        self
+    }
+
+    /// Builder: set [`chaos`](Self::chaos).
+    #[must_use]
+    pub fn with_chaos(mut self, v: bool) -> Self {
+        self.chaos = v;
+        self
+    }
 }
 
 impl Default for EcplParams {
@@ -490,7 +514,7 @@ pub fn region_restrict(mdct: &[f32; N_COEFFS], geom: &EcplGeometry) -> [f32; 256
 mod tests {
     use super::*;
     use crate::eac3::ecpl::{
-        generate_channel_coeffs, reconstruct_carrier, DEFAULT_ECPL_BNDSTRC, ECPL_ANGLE_TAB,
+        DEFAULT_ECPL_BNDSTRC, ECPL_ANGLE_TAB, generate_channel_coeffs, reconstruct_carrier,
     };
     use crate::mdct::mdct_512;
     use crate::tables::WINDOW;
@@ -580,7 +604,7 @@ mod tests {
         // Grid midpoints round to the nearest step.
         assert_eq!(chaos_code_for(0.5), 4); // (1-0.5)*7 = 3.5 → 4
         assert_eq!(chaos_code_for(1.5), 0); // clamped
-                                            // Amplitude-modification factor: 1 + 0.38·(-code/7).
+        // Amplitude-modification factor: 1 + 0.38·(-code/7).
         assert!((chaos_amp_factor(0) - 1.0).abs() < 1e-6);
         assert!((chaos_amp_factor(7) - 0.62).abs() < 1e-6);
         assert!((chaos_amp_factor(3) - (1.0 - 0.38 * 3.0 / 7.0)).abs() < 1e-6);

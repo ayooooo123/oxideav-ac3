@@ -7,9 +7,199 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- E-AC-3 decoder: **JOC objects render to a caller-selected speaker
+  layout** — `stereo`, `5.1`, `5.1.2`, `5.1.4`, `7.1`, `7.1.2`, `7.1.4`,
+  `9.1.6` (`eac3::JocLayout`, speakers as `eac3::JocSpeaker`). Typed
+  options `decoder::Eac3DecoderOptions` with
+  `decoder::make_eac3_decoder_with_options` /
+  `make_eac3_decoder_with_joc_layout`; on the registry path the
+  `joc_layout` entry of `CodecParameters::options` (schema registered
+  with the `eac3` decoder). A multichannel layout fixes the output
+  shape: object frames are rendered with a layered equal-power balance
+  panner driven by the OAMD position, size, channel lock and zone
+  constraints (TS 103 420 geometry: clause 4.2.1, Tables A.7, B.10,
+  20, 21; the panning law is this crate's design), every other frame
+  routes its coded channels to their own speakers, and
+  `Decoder::output_params` describes the layout (#20).
+- Decode-vs-reference programme matrix (`generated_program_matrix_*`):
+  the black-box encoder is fed music-, speech- and transient-like
+  material as mono / stereo / 5.1 at 32 / 44.1 / 48 kHz across starved
+  to transparent rates and both coupling extremes — 135 streams, each
+  held to the 50 dB / noise-ceiling gate with the per-segment dropout
+  check (#13).
+- OAMD bed objects keep their speaker label (Tables 12 / 13) and are
+  rendered — at their own speaker, or panned at its Table B.10 position
+  when the layout lacks it. Bed programs previously fell back to the
+  channel downmix.
+
+- E-AC-3 encoder: standard coupling (`cpl`, `cpl_begf`, `cpl_endf`
+  options; Annex E `ecplinu = 0`), co-active with SPX through the Table
+  E1.4 derived (possibly negative) `cplendf` — the issue-#13 broadcast
+  geometry — plus a `dither = 0` option for deterministic decodes. The
+  decode-vs-ffmpeg harness sweeps every `spxbegf` with coupling and
+  seven transmitted coupling regions (#13).
+- Decode-vs-ffmpeg gates are noise-ceiling aware: each stream is also
+  decoded under a second decoder-private noise seed (hidden
+  `Eac3DecoderState::reseed_noise`), and the floor drops only to 4 dB
+  under that ours-vs-ours ceiling; every 1536-sample segment is checked
+  for dropouts. The env-gated `OXIDEAV_AC3_LOCAL_EAC3` broadcast-capture
+  gate uses the same rules (#13).
+- `CrcStatus::new`, `AudioProductionParams::new`,
+  `Eac3AudioProduction::new`, `IndepProgramShape::new`, and `with_*`
+  setters on `DrcSettings`, `MetadataParams`, `AudioProductionParams`,
+  `EcplParams`, `SpxParams` and the four `Eac3*` metadata records.
+
+### Fixed
+
+- E-AC-3 decoder: a hostile packet whose first syncframe is concealed
+  (no program channels) panicked with an out-of-bounds index when a
+  mono / stereo downmix was requested; the §7.8 matrix input is now
+  bounded by the channels the program actually has. Found by the
+  `decode_frames` fuzz target once it started requesting stereo.
+- Decoder (AC-3 and E-AC-3): the §7.3.4 dither generator returned its
+  whole 16-bit register after a one-bit shift, so values landing on
+  adjacent transform coefficients correlated at 0.5 and a sparsely-set
+  register produced runs of near-identical full-scale values (noise
+  neither spectrally flat within a block nor steady in level between
+  blocks; +4.7 dB over nominal measured on one transient block). It is
+  now a full-step 32-bit xorshift with a mixed 16-bit output: uniform
+  in ±0.707 and uncorrelated at every lag. Decoded waveforms change in
+  their dither component only (#13).
+- Decoder (AC-3 and E-AC-3): zero-bit coupling-channel mantissas are
+  now dithered per coupled channel after decoupling when that
+  channel's `dithflag` is set (§7.3.4); they were left at zero, leaving
+  spectral holes in coupled high bands at low rates (#13).
+
+### Changed
+
+- Performance, output bit-identical (`examples/throughput.rs`; 5.1,
+  single thread, × real time before → after): AC-3 encode 0.7 → 25.6,
+  E-AC-3 encode 0.6 → 19.7 (SPX + coupling 1.2 → 36.3, AHT 2.1 →
+  42.6); AC-3 decode 253 → 469, E-AC-3 decode 228 → 402; JOC object
+  rendering 8–10 → 37–44. Tabulated forward-MDCT kernels, a
+  mask-once / bisected SNR-offset search, memoised exponent-cadence
+  runs, cached IMDCT twiddles and FFT stage tables, tabulated `2^-exp`,
+  debug switches read once per process, and QMF / object-mix loops
+  nested for independent accumulators.
+- API hygiene: `DrcMode` (enum) and the records `CrcStatus`,
+  `DrcSettings`, `encoder::AudioProductionParams`,
+  `encoder::MetadataParams`, `eac3::EcplParams`, `eac3::SpxParams`,
+  `eac3::encoder::{Eac3MixMetadata, Eac3InfoMetadata,
+  Eac3AudioProduction, Eac3Metadata}`, `eac3::decoder::IndepProgramShape`
+  and `eac3::Eac3Bsi` are now `#[non_exhaustive]`. Build them with
+  `Default` / `new(..)` plus the `with_*` setters; fields stay readable.
+  `StreamType`, `PremixCompressionWord` and `DrcSource` stay exhaustive
+  (they decode fixed 2-bit / 1-bit fields).
+
 - decoder (PearTube fork): **decode on demand, a frame or two of memory per packet** — `send_packet` decoded every frame of a packet up front and queued all their PCM; a packet of many small frames held them all at once (a 128-byte 5.1 frame decodes to 36 KiB). It now holds the packet and decodes one frame ahead, as `avcodec_send_packet` does; `receive_frame` decodes the rest one frame per call, feeding the rest of the packet again and dropping it on an error, as FFmpeg's decode loop does. `tests/memory.rs`: three frames of a 128-frame packet cost 1.6 MB before, under 512 KiB now; every FFmpeg comparison unchanged.
 
 - decoder (PearTube fork): **the registered decoder is FFmpeg's, ported** (`src/ffdec`, LGPL-2.1-or-later: FFmpeg 2da55bf `ac3dec.c`, `eac3dec.c`, `ac3.c`, `ac3dsp.c` bit allocation, the AC-3 / E-AC-3 tables, the KBD window, the inverse MDCT's definition and `AVLFG`). `decoder::make_decoder` and `make_eac3_decoder` now return it: planar `F32P` frames in FFmpeg's channel order, the layout reported through `Decoder::output_audio_format`, FFmpeg's frames for FFmpeg's packets (a cut last frame is concealed with the previous frame's last block, as FFmpeg does, instead of refused; a packet holding several frames decodes them all). On every FATE `ac3/` and `eac3/` stream (12, including E-AC-3 7.1 with dependent substreams and spectral extension) it emits FFmpeg's frame count and sizes and samples 139-140 dB SNR from FFmpeg's C code paths; the native decoder was 34 dB from it on `millers_crossing_4.0` and one frame short on `monsters_inc_2.0`. The native decoder stays behind `make_native_decoder` (new; what `make_decoder` returned before), `make_decoder_ltrt`, `make_decoder_with_drc` and `make_eac3_decoder_with_joc`. Tests and examples that read the default decoder's output now read planar float. Builds against the core fork with `output_audio_format` (`[patch.crates-io]`).
+
+## [0.0.12](https://github.com/OxideAV/oxideav-ac3/compare/v0.0.11...v0.0.12) - 2026-10-24
+
+### Fixed
+
+- fixup for #18: CHANGELOG entry + as_chunks in the band tests
+- fixup for #17: F32 output on every decoder path, pinned
+
+### Other
+
+- raw .ac3/.eac3 elementary-stream demuxer + probe; decoder splits multi-syncframe packets
+- coupling / per-block-SNR A/B knobs are construction-time options; the two env-mutating tests run with the suite
+- §7.7.1 dynrng scales the LFE channel; broadcast-shape decode matrix vs ffmpeg (issue #13)
+- three entries of the 44.1 kHz hearing threshold row (bands 25, 28, 34)
+- opt-in F32 output (CodecParameters::sample_format = F32)
+- edition 2024, MSRV 1.95
+- README install snippet drops the retired oxideav-codec/oxideav-container crates
+- budget guards from the r457 fuzz round + AC-3 encoder round-trip fuzz target
+- equal-rate position ladder + r457 encoder status
+- joint block switching + §8.2.9 dither defeat
+- code all seven LFE bins (§7.1.3 lfeendmant = 7)
+- §7.2.2.1.1 all-zero SNR-offset special case
+- exponent-sharing bound + per-channel cadence/strategy election by measured cost (§7.1.3)
+- equal-rate rate-distortion harness (corpus + both encoders + both decoders + SNR/NMR scoring)
+
+### Added
+
+- container: **raw `.ac3` / `.eac3` / `.ec3` elementary-stream demuxer +
+  probe** (`container`, registered through `register!` as container
+  `ac3`; umbrella playback corpus #4 cells 120–122). One packet per
+  presentation period — an AC-3 syncframe (Table 5.18 length, 1536
+  samples) or an E-AC-3 program-0 independent frame plus the dependent /
+  additional-program frames behind it (`frmsiz`, `numblkscod` blocks,
+  reduced `fscod2` rates) — timestamps in samples, constant-rate
+  duration estimate, packet-boundary seeking, resync over junk and
+  orphan dependent frames. The probe needs 0x0B77 + a valid header at
+  offset 0 and at the first frame's end. Packet counts match
+  `ffprobe -count_frames` on the corpus cells (`tests/elementary_stream.rs`).
+
+- decoder: **packets carrying several consecutive syncframes decode
+  completely**. `send_packet` splits the payload into presentation
+  periods (AC-3 frame / E-AC-3 program-0 independent frame with its
+  followers) and `receive_frame` drains them in order with per-period
+  timestamps; previously a multi-frame packet (an MPEG-TS PES payload)
+  decoded only its last independent frame.
+
+- decoder: **opt-in F32 output** (#17, ropoctl) — a decoder built with
+  `CodecParameters::sample_format = Some(SampleFormat::F32)` emits each
+  frame as interleaved little-endian f32 in the same WAVE channel order
+  as the S16 output, taken before the S16 quantisation. The AC-3 path,
+  the E-AC-3 passthrough (independent + spliced dependent substreams),
+  downmix and JOC stereo paths all honour it; with S16 or no
+  `sample_format` the output is byte-for-byte unchanged.
+
+### Fixed
+
+- decoder: **§7.7.1 `dynrng` now scales the LFE channel** (AC-3 and
+  E-AC-3). §5.4.3.4 applies the word to "the reproduced audio" and §6.1.9
+  to the block's coefficients with no channel exemption (only 1+1 mode
+  splits it into `dynrng` / `dynrng2` per channel); both decoders scaled
+  the fbw channels only, so a 5.1 stream carrying `dynrng` played its LFE
+  up to 24 dB off the rest of the program. Found by the r480
+  broadcast-shape matrix against the black-box decoder (every channel
+  ≥ 89 dB, LFE 17–37 dB; now 92–93 dB). `tests/dynrng_lfe.rs` pins the
+  LFE gain against Table 7.29 for both encoders' streams.
+
+- tables: **Table 7.15 hearing threshold, 44.1 kHz row** (#18, ropoctl)
+  — `HTH[1]` bands 25, 28 and 34 were one step off the staged spec
+  (`0x0340`/`0x0310`/`0x0300` for `0x0350`/`0x0320`/`0x02f0`). Where a
+  band's mask is the hearing threshold the decoder's `bap[]` then
+  differed from the encoder's, the mantissa unpack lost sync and the
+  rest of the frame decoded to noise (a 44.1 kHz stereo tone at 192 kb/s
+  decoded at −0.5 … 10 dB; now > 30 dB). All 150 cells of `HTH` are
+  verified against A/52:2018 Table 7.15; the encoder shares the table.
+  `tests/hearing_threshold_44k.rs` pins each band with a short
+  black-box-encoded fixture.
+
+### Changed
+
+- tests (issue #13 follow-through): **broadcast-shape decode matrix**
+  (`tests/eac3_decode_ffmpeg.rs::crafted_broadcast_matrix_*`) — our
+  E-AC-3 encoder emits every coding tool it can switch on (plain, SPX,
+  AHT, TPNP, SPX + TPNP + the full metadata set, AHT + mixing metadata)
+  at 48 / 44.1 / 32 kHz on stereo 192 kb/s and 5.1 448 kb/s six-block
+  frames plus the 1/2/3-block fractional-frame shapes, and the black-box
+  decoder must agree with ours at ≥ 50 dB per channel with zero
+  zero-filled frames (40 cells per rate; observed 57–93 dB). Cells are
+  chosen where the oracle is meaningful: SPX runs with `spxblnd = 31`
+  because the §E.3.6.4.2 noise component comes from a decoder-private
+  generator (measured: blend 0 → 20–30 dB, blend 31 → 68–77 dB between
+  decoders, identical spectra), the per-channel budget keeps the §7.3.4
+  dither floor out of the gate, and enhanced coupling / dependent
+  substreams stay out because the oracle does not render them (ecpl:
+  −512-sample lag at 12 dB; 7.1 pair: it drops the indep Ls/Rs and
+  leaves one output channel silent).
+
+- encoder: the coupling and per-block-SNR A/B knobs are construction-time
+  options (`cpl = 0`, `perblock_snr = 0`) read once into the encoder; the
+  `AC3_DISABLE_CPL` / `AC3_DISABLE_PERBLOCK_SNR` environment variables
+  still work but are no longer consulted per frame. The two A/B tests that
+  used to mutate the process environment (and were `#[ignore]`d for it)
+  now run with the rest of the suite.
+
+- edition 2024, MSRV 1.95.
 
 - encoder r457: **equal-rate rate-distortion harness** (`tests/common/rd.rs`, `tests/equal_rate.rs`, `examples/equal_rate_report`) — a deterministic synthetic corpus (speech, music, transients, two-tone, pink noise, 5.1 with LFE; 16 kHz band-limited) is encoded by our AC-3 / E-AC-3 encoder and by the black-box reference encoder at equal nominal rate, every stream is decoded by both our decoder and the reference decoder, and each decode is scored by worst-channel SNR and a mean noise-to-mask ratio (§7.2.2 parametric mask on the source MDCT). The test pins per-cell floors, the decoder agreement on our streams (< 1.5 dB) and the distance to the reference encoder; README carries the ladder. The harness immediately exposed that the r454 "~24 dB flat" two-tone table was an aliased lag-search artefact: the standard path measured ≈ 12 dB at every rate.
 

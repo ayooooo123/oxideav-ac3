@@ -23,14 +23,14 @@
 //! implementation produces a syntactically-valid syncframe for the
 //! 48 kHz stereo 192 kbps mode.
 
-use oxideav_core::bits::BitWriter;
 use oxideav_core::Encoder;
+use oxideav_core::bits::BitWriter;
 use oxideav_core::{
     AudioFrame, ChannelLayout, CodecId, CodecParameters, Error, Frame, Packet, Result,
     SampleFormat, TimeBase,
 };
 
-use crate::audblk::{remat_band_count, BLOCKS_PER_FRAME, MAX_FBW, N_COEFFS, SAMPLES_PER_BLOCK};
+use crate::audblk::{BLOCKS_PER_FRAME, MAX_FBW, N_COEFFS, SAMPLES_PER_BLOCK, remat_band_count};
 
 /// LFE channel mantissa-bin upper bound. Per §7.1.3 / §5.4.3.23 the LFE
 /// is fixed at 7 mantissa bins (one D15 absexp + 2 groups of 3 deltas →
@@ -40,9 +40,9 @@ pub(crate) const LFE_END_MANT: usize = 7;
 use crate::decoder::SAMPLES_PER_FRAME;
 use crate::mdct::{mdct_256_pair, mdct_512};
 use crate::tables::{
-    frame_length_bytes, nominal_bitrate_kbps, BAPTAB, BNDSZ, BNDTAB, DBPBTAB, FASTDEC, FASTGAIN,
-    FLOORTAB, HTH, LATAB, MANT_LEVEL_11, MANT_LEVEL_15, MANT_LEVEL_3, MANT_LEVEL_5, MANT_LEVEL_7,
-    MASKTAB, QUANTIZATION_BITS, SLOWDEC, SLOWGAIN, WINDOW,
+    BAPTAB, BNDSZ, BNDTAB, DBPBTAB, FASTDEC, FASTGAIN, FLOORTAB, HTH, LATAB, MANT_LEVEL_3,
+    MANT_LEVEL_5, MANT_LEVEL_7, MANT_LEVEL_11, MANT_LEVEL_15, MASKTAB, QUANTIZATION_BITS, SLOWDEC,
+    SLOWGAIN, WINDOW, frame_length_bytes, nominal_bitrate_kbps,
 };
 
 /// Build an encoder instance. Required parameters (via
@@ -110,7 +110,7 @@ pub fn make_encoder_with_metadata(
         _ => {
             return Err(Error::Unsupported(format!(
                 "ac3 encoder: unsupported channel count {channels} (must be 1..=6)"
-            )))
+            )));
         }
     };
     let fscod: u8 = match sample_rate {
@@ -120,7 +120,7 @@ pub fn make_encoder_with_metadata(
         _ => {
             return Err(Error::Unsupported(format!(
                 "ac3 encoder: unsupported sample rate {sample_rate} (48000/44100/32000 only)"
-            )))
+            )));
         }
     };
 
@@ -191,7 +191,26 @@ pub fn make_encoder_with_metadata(
         pts: 0,
         cadence_csnr: CADENCE_CSNR_INIT,
         last_blksw: vec![false; nfchans],
+        disable_cpl: parse_disable_knob(params, "cpl", "AC3_DISABLE_CPL")?,
+        disable_perblock_snr: parse_disable_knob(
+            params,
+            "perblock_snr",
+            "AC3_DISABLE_PERBLOCK_SNR",
+        )?,
     }))
+}
+
+/// Construction-time A/B knob: the `CodecParameters::options` key
+/// (`"0"` / `"false"` disables the tool; absent or `"1"` keeps it) or,
+/// as the legacy switch, the named environment variable being set.
+/// Read once here so an encode never consults the process environment
+/// mid-frame.
+fn parse_disable_knob(params: &CodecParameters, key: &str, env: &str) -> Result<bool> {
+    let via_option = match params.options.get(key) {
+        Some(v) => !parse_bool_opt(key, v)?,
+        None => false,
+    };
+    Ok(via_option || std::env::var(env).is_ok())
 }
 
 /// Construction-time minimum-rate floor (the E-AC-3 encoder's twin):
@@ -288,11 +307,33 @@ fn pick_frmsizecod(kbps: u32) -> Option<u8> {
 /// `80 + mixlevel` dB SPL) and the 2-bit `roomtyp` code (Table 5.12:
 /// 0 = not indicated, 1 = large room / X-curve, 2 = small room / flat).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct AudioProductionParams {
     /// `mixlevel` (5 bits, 0..=31) — §5.4.2.14.
     pub mixlevel: u8,
     /// `roomtyp` (2 bits, 0..=2; 3 is reserved) — §5.4.2.15.
     pub roomtyp: u8,
+}
+
+impl AudioProductionParams {
+    /// Build a [`AudioProductionParams`] from every field.
+    pub fn new(mixlevel: u8, roomtyp: u8) -> Self {
+        Self { mixlevel, roomtyp }
+    }
+
+    /// Builder: set [`mixlevel`](Self::mixlevel).
+    #[must_use]
+    pub fn with_mixlevel(mut self, v: u8) -> Self {
+        self.mixlevel = v;
+        self
+    }
+
+    /// Builder: set [`roomtyp`](Self::roomtyp).
+    #[must_use]
+    pub fn with_roomtyp(mut self, v: u8) -> Self {
+        self.roomtyp = v;
+        self
+    }
 }
 
 /// Encoder-side bitstream-metadata surface: the §5.4.2 BSI advisory
@@ -313,6 +354,7 @@ pub struct AudioProductionParams {
 /// `mixlevel` (0..=31) + `roomtyp` (0..=2) (setting either emits
 /// `audprodie = 1`), `copyright` and `origbs` (`1`/`true`/`0`/`false`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct MetadataParams {
     /// `dialnorm` (5 bits, §5.4.2.8) — dB of dialogue headroom below
     /// digital 100%, valid `1..=31` (`0` is reserved on the wire).
@@ -349,6 +391,85 @@ pub struct MetadataParams {
     pub copyrightb: bool,
     /// `origbs` (§5.4.2.25).
     pub origbs: bool,
+}
+
+impl MetadataParams {
+    /// Builder: set [`dialnorm`](Self::dialnorm).
+    #[must_use]
+    pub fn with_dialnorm(mut self, v: u8) -> Self {
+        self.dialnorm = v;
+        self
+    }
+
+    /// Builder: set [`compr`](Self::compr).
+    #[must_use]
+    pub fn with_compr(mut self, v: Option<u8>) -> Self {
+        self.compr = v;
+        self
+    }
+
+    /// Builder: set [`dynrng`](Self::dynrng).
+    #[must_use]
+    pub fn with_dynrng(mut self, v: Option<u8>) -> Self {
+        self.dynrng = v;
+        self
+    }
+
+    /// Builder: set [`bsmod`](Self::bsmod).
+    #[must_use]
+    pub fn with_bsmod(mut self, v: u8) -> Self {
+        self.bsmod = v;
+        self
+    }
+
+    /// Builder: set [`cmixlev`](Self::cmixlev).
+    #[must_use]
+    pub fn with_cmixlev(mut self, v: u8) -> Self {
+        self.cmixlev = v;
+        self
+    }
+
+    /// Builder: set [`surmixlev`](Self::surmixlev).
+    #[must_use]
+    pub fn with_surmixlev(mut self, v: u8) -> Self {
+        self.surmixlev = v;
+        self
+    }
+
+    /// Builder: set [`dsurmod`](Self::dsurmod).
+    #[must_use]
+    pub fn with_dsurmod(mut self, v: u8) -> Self {
+        self.dsurmod = v;
+        self
+    }
+
+    /// Builder: set [`langcod`](Self::langcod).
+    #[must_use]
+    pub fn with_langcod(mut self, v: Option<u8>) -> Self {
+        self.langcod = v;
+        self
+    }
+
+    /// Builder: set [`audprod`](Self::audprod).
+    #[must_use]
+    pub fn with_audprod(mut self, v: Option<AudioProductionParams>) -> Self {
+        self.audprod = v;
+        self
+    }
+
+    /// Builder: set [`copyrightb`](Self::copyrightb).
+    #[must_use]
+    pub fn with_copyrightb(mut self, v: bool) -> Self {
+        self.copyrightb = v;
+        self
+    }
+
+    /// Builder: set [`origbs`](Self::origbs).
+    #[must_use]
+    pub fn with_origbs(mut self, v: bool) -> Self {
+        self.origbs = v;
+        self
+    }
 }
 
 impl Default for MetadataParams {
@@ -564,6 +685,13 @@ struct Ac3Encoder {
     /// Per fbw channel: was the previous frame's last block switched?
     /// (§8.2.9 dither defeat spans the block after a short block.)
     last_blksw: Vec<bool>,
+    /// A/B knob: skip §7.4 channel coupling entirely (option `cpl = 0`
+    /// or the `AC3_DISABLE_CPL` environment variable at construction).
+    disable_cpl: bool,
+    /// A/B knob: pin every block to the frame's flat SNR-offset plan
+    /// instead of the per-block §5.4.3.37-43 redistribution (option
+    /// `perblock_snr = 0` or `AC3_DISABLE_PERBLOCK_SNR` at construction).
+    disable_perblock_snr: bool,
 }
 
 impl Encoder for Ac3Encoder {
@@ -581,7 +709,7 @@ impl Encoder for Ac3Encoder {
             _ => {
                 return Err(Error::invalid(
                     "ac3 encoder: send_frame requires an audio frame",
-                ))
+                ));
             }
         };
         // Per-frame channel-count and sample-rate are no longer carried on
@@ -618,7 +746,7 @@ impl Encoder for Ac3Encoder {
         if missing > 0 {
             let total_chans = self.channels + usize::from(self.lfeon);
             for ch in 0..total_chans {
-                self.pending_samples[ch].extend(std::iter::repeat(0.0).take(missing));
+                self.pending_samples[ch].extend(std::iter::repeat_n(0.0, missing));
             }
         }
         self.emit_syncframe()?;
@@ -677,7 +805,7 @@ pub(crate) fn decode_input_samples(
         other => {
             return Err(Error::Unsupported(format!(
                 "ac3 encoder: sample format {other:?} not yet supported"
-            )))
+            )));
         }
     }
     Ok(out)
@@ -688,13 +816,13 @@ impl Ac3Encoder {
         let n_per = SAMPLES_PER_FRAME as usize;
         let total_chans = self.channels + usize::from(self.lfeon);
         let lfe_idx = self.channels; // index into pending_samples / delay_line for LFE
-                                     // Run the 6-block MDCT pipeline per channel and stash coefficient
-                                     // blocks per channel: blocks × N_COEFFS.
-                                     // We allocate `channels + 1` slots so LFE coefficients can live
-                                     // at index `self.channels` when present, mirroring the source-
-                                     // interleaved layout (LFE last). Index isn't a coupling
-                                     // pseudo-channel here — that lives at index `self.channels` in a
-                                     // *separate* `+1`-sized exps array allocated below.
+        // Run the 6-block MDCT pipeline per channel and stash coefficient
+        // blocks per channel: blocks × N_COEFFS.
+        // We allocate `channels + 1` slots so LFE coefficients can live
+        // at index `self.channels` when present, mirroring the source-
+        // interleaved layout (LFE last). Index isn't a coupling
+        // pseudo-channel here — that lives at index `self.channels` in a
+        // *separate* `+1`-sized exps array allocated below.
         let mut coeffs: Vec<Vec<[f32; N_COEFFS]>> =
             vec![vec![[0.0; N_COEFFS]; BLOCKS_PER_FRAME]; total_chans];
         // Pass 1 — drain this frame's PCM and run the §8.2.2 transient
@@ -832,7 +960,7 @@ impl Ac3Encoder {
         // re-derives L_recv = cplmant * cplco_L * 8, R_recv = cplmant *
         // cplco_R * 8 — preserving the per-band envelope of each
         // channel without spending bits on per-channel mantissas.
-        let cpl_disabled = std::env::var("AC3_DISABLE_CPL").is_ok();
+        let cpl_disabled = self.disable_cpl;
         let mut cpl = CouplingPlan::default();
         // ATSC A/52 §7.4: coupling is allowed for any acmod with ≥ 2 fbw
         // channels. The coupling group can include up to 5 fbw channels
@@ -1446,7 +1574,7 @@ impl Ac3Encoder {
         // snroffste so the decoder applies the new values immediately.
         // The AC3_DISABLE_PERBLOCK_SNR env var pins the plan to the
         // flat global one — useful for A/B-ing the contribution.
-        let snr_plan = if std::env::var("AC3_DISABLE_PERBLOCK_SNR").is_ok() {
+        let snr_plan = if self.disable_perblock_snr {
             PerBlockSnr::from_global(&tuned_ba)
         } else {
             tune_per_block_snroffst_with_plan(
@@ -2702,12 +2830,11 @@ pub(crate) fn pick_strategy_for_block(exp: &[u8], end: usize) -> u8 {
     } else {
         1
     };
-    if let Ok(force) = std::env::var("AC3_FORCE_EXPSTR") {
-        if let Ok(v) = force.parse::<u8>() {
-            if (1..=3).contains(&v) {
-                return v;
-            }
-        }
+    if let Ok(force) = std::env::var("AC3_FORCE_EXPSTR")
+        && let Ok(v) = force.parse::<u8>()
+        && (1..=3).contains(&v)
+    {
+        return v;
     }
     pick
 }
@@ -2826,17 +2953,60 @@ pub(crate) fn elect_exponent_cadence(
     let mut best_cost = u32::MAX;
     let mut best_pattern = 0u32;
     let mut best_strats = [0u8; BLOCKS_PER_FRAME];
+    // A run (anchor block .. next anchor) is costed from its own blocks
+    // alone — the shared set is the anchor bounded by the blocks that
+    // reuse it — so the 2^(nblks-1) patterns only ever ask for the
+    // nblks·(nblks+1)/2 distinct runs. Each is evaluated once, on first
+    // use: `(exponent + mantissa bits, strategy)`.
+    let mut run_memo = [[None::<(u32, u8)>; BLOCKS_PER_FRAME + 1]; BLOCKS_PER_FRAME];
     let mut work: Vec<[u8; N_COEFFS]> = exps[..nblks].to_vec();
+    let mut evaluate_run = |blk: usize, run_end: usize| -> (u32, u8) {
+        if let Some(known) = run_memo[blk][run_end] {
+            return known;
+        }
+        // The run's shared set: its anchor, bounded by its reuse blocks.
+        let mut anchors = [1u8; BLOCKS_PER_FRAME];
+        for a in anchors.iter_mut().take(run_end).skip(blk + 1) {
+            *a = 0;
+        }
+        for (w, e) in work.iter_mut().zip(exps.iter()) {
+            w[lo..hi].copy_from_slice(&e[lo..hi]);
+        }
+        bound_shared_exponents(&mut work, &anchors, lo, hi);
+        let run: Vec<usize> = (blk..run_end).collect();
+        // The cheapest legal strategy for this run's shared set.
+        let mut run_best = u32::MAX;
+        let mut run_best_pattern = 0u32;
+        let mut run_strat = 1u8;
+        for &strat in strategies {
+            let mut set = work[blk];
+            preprocess_d15(&mut set[lo..hi]);
+            let grpsize = match strat {
+                2 => 2,
+                3 => 4,
+                _ => 1,
+            };
+            if grpsize > 1 {
+                quantise_exponents_to_grpsize(&mut set[lo..hi], grpsize);
+            }
+            let ebits = 4 + 7 * ngrps_for_strategy(width, grpsize) as u32 + 2 + chbw_bits;
+            let (mant, mismatch) = run_cost(&set, &run);
+            let c = ebits + mant + mismatch;
+            if c < run_best {
+                run_best = c;
+                run_best_pattern = ebits + mant;
+                run_strat = strat;
+            }
+        }
+        run_memo[blk][run_end] = Some((run_best_pattern, run_strat));
+        (run_best_pattern, run_strat)
+    };
     for pattern in 0..(1u32 << (nblks - 1)) {
         let mut anchors = [0u8; BLOCKS_PER_FRAME];
         anchors[0] = 1;
         for blk in 1..nblks {
             anchors[blk] = ((pattern >> (blk - 1)) & 1) as u8;
         }
-        for (w, e) in work.iter_mut().zip(exps.iter()) {
-            w[lo..hi].copy_from_slice(&e[lo..hi]);
-        }
-        bound_shared_exponents(&mut work, &anchors, lo, hi);
         let mut cost = 0u32;
         let mut strats = [0u8; BLOCKS_PER_FRAME];
         let mut blk = 0usize;
@@ -2845,31 +3015,7 @@ pub(crate) fn elect_exponent_cadence(
             while run_end < nblks && anchors[run_end] == 0 {
                 run_end += 1;
             }
-            let run: Vec<usize> = (blk..run_end).collect();
-            // The cheapest legal strategy for this run's shared set.
-            let mut run_best = u32::MAX;
-            let mut run_best_pattern = 0u32;
-            let mut run_strat = 1u8;
-            for &strat in strategies {
-                let mut set = work[blk];
-                preprocess_d15(&mut set[lo..hi]);
-                let grpsize = match strat {
-                    2 => 2,
-                    3 => 4,
-                    _ => 1,
-                };
-                if grpsize > 1 {
-                    quantise_exponents_to_grpsize(&mut set[lo..hi], grpsize);
-                }
-                let ebits = 4 + 7 * ngrps_for_strategy(width, grpsize) as u32 + 2 + chbw_bits;
-                let (mant, mismatch) = run_cost(&set, &run);
-                let c = ebits + mant + mismatch;
-                if c < run_best {
-                    run_best = c;
-                    run_best_pattern = ebits + mant;
-                    run_strat = strat;
-                }
-            }
+            let (run_best_pattern, run_strat) = evaluate_run(blk, run_end);
             strats[blk] = run_strat;
             cost += run_best_pattern;
             if blk > 0 {
@@ -2973,6 +3119,12 @@ impl BitAllocParams {
     /// the allocator. The per-channel substitution helpers keep the
     /// vector fields in step with the values actually transmitted, so
     /// this reads the same set the decoder will see.
+    /// The combined SNR offset `(((csnroffst − 15) << 4) + fsnroffst) << 2`
+    /// (§7.2.2.5) of the channel these parameters describe.
+    pub(crate) fn snroffset(&self) -> i32 {
+        (((self.csnroffst as i32 - 15) << 4) + self.fsnroffst as i32) << 2
+    }
+
     pub(crate) fn all_snr_offsets_zero(&self) -> bool {
         self.csnroffst == 0
             && self.fsnroffst == 0
@@ -3027,130 +3179,481 @@ pub(crate) fn compute_bap_table(
         bap_out[..end].fill(0);
         return;
     }
-    // PSD
-    let mut psd = [0i32; N_COEFFS];
-    for bin in 0..end {
-        psd[bin] = 3072 - ((exp[bin] as i32) << 7);
+    MaskedPsd::fbw(exp, end, fscod, ba, dba).for_each_bap(
+        false,
+        ba.snroffset(),
+        ptr_tab,
+        |i, bap| {
+            bap_out[i] = bap;
+        },
+    );
+}
+
+/// The SNR-offset-independent part of the §7.2.2 parametric allocation
+/// of one channel in one block: the PSD, and the masking curve with
+/// the delta-bit-allocation segments applied. Only the last step —
+/// subtracting the SNR offset and looking the pointer up — depends on
+/// `csnroffst` / `fsnroffst`, so the encoder's offset searches build
+/// this once per channel and block and re-run only that step.
+#[derive(Clone)]
+pub(crate) struct MaskedPsd {
+    psd: [i32; N_COEFFS],
+    mask: [i32; 50],
+    /// First and one-past-last coefficient of the channel.
+    start: usize,
+    end: usize,
+    floor: i32,
+}
+
+impl MaskedPsd {
+    /// A channel without coefficients.
+    fn empty() -> Self {
+        Self {
+            psd: [0; N_COEFFS],
+            mask: [0; 50],
+            start: 0,
+            end: 0,
+            floor: 0,
+        }
     }
-    // Band PSD
-    let mut bndpsd = [0i32; 50];
-    let bndstrt = MASKTAB[0] as usize;
-    let bndend = MASKTAB[end - 1] as usize + 1;
-    {
-        let mut j = 0usize;
-        let mut k = bndstrt;
-        loop {
-            let lastbin = (BNDTAB[k] as usize + BNDSZ[k] as usize).min(end);
-            bndpsd[k] = psd[j];
-            j += 1;
-            while j < lastbin {
-                bndpsd[k] = logadd(bndpsd[k], psd[j]);
+
+    /// Full-bandwidth (or LFE) channel, coefficients `0..end`.
+    pub(crate) fn fbw(
+        exp: &[u8; N_COEFFS],
+        end: usize,
+        fscod: u8,
+        ba: &BitAllocParams,
+        dba: Option<(&DbaPlan, usize)>,
+    ) -> Self {
+        if end == 0 {
+            return Self::empty();
+        }
+        // PSD
+        let mut psd = [0i32; N_COEFFS];
+        for bin in 0..end {
+            psd[bin] = 3072 - ((exp[bin] as i32) << 7);
+        }
+        // Band PSD
+        let mut bndpsd = [0i32; 50];
+        let bndstrt = MASKTAB[0] as usize;
+        let bndend = MASKTAB[end - 1] as usize + 1;
+        {
+            let mut j = 0usize;
+            let mut k = bndstrt;
+            loop {
+                let lastbin = (BNDTAB[k] as usize + BNDSZ[k] as usize).min(end);
+                bndpsd[k] = psd[j];
                 j += 1;
+                while j < lastbin {
+                    bndpsd[k] = logadd(bndpsd[k], psd[j]);
+                    j += 1;
+                }
+                k += 1;
+                if end <= lastbin {
+                    break;
+                }
             }
-            k += 1;
-            if end <= lastbin {
+        }
+        // Excitation — fbw, non-coupled path.
+        let sdecay = SLOWDEC[ba.sdcycod as usize];
+        let fdecay = FASTDEC[ba.fdcycod as usize];
+        let sgain = SLOWGAIN[ba.sgaincod as usize];
+        let dbknee = DBPBTAB[ba.dbpbcod as usize];
+        let floor = FLOORTAB[ba.floorcod as usize];
+        let fgain = FASTGAIN[ba.fgaincod as usize];
+
+        let mut excite = [0i32; 50];
+        let mut lowcomp = 0i32;
+        // §7.2.2.4 fbw path (start == 0). The `lfe_last` flag mirrors the
+        // decoder's same-named branch: when this channel is the LFE
+        // (end == 7), we skip the calc_lowcomp call at bin=6 so encoder
+        // and decoder derive the same excitation/mask/bap[] arrays.
+        let lfe_last = end == 7;
+        if bndend > 0 {
+            lowcomp = calc_lowcomp(lowcomp, bndpsd[0], bndpsd[1], 0);
+            excite[0] = bndpsd[0] - fgain - lowcomp;
+        }
+        if bndend > 1 {
+            lowcomp = calc_lowcomp(lowcomp, bndpsd[1], bndpsd[2], 1);
+            excite[1] = bndpsd[1] - fgain - lowcomp;
+        }
+        let mut begin = 7.min(bndend);
+        let mut fastleak = 0i32;
+        let mut slowleak = 0i32;
+        for bin in 2..7.min(bndend) {
+            if !(lfe_last && bin == 6) {
+                lowcomp = calc_lowcomp(lowcomp, bndpsd[bin], bndpsd[bin + 1], bin);
+            }
+            fastleak = bndpsd[bin] - fgain;
+            slowleak = bndpsd[bin] - sgain;
+            excite[bin] = fastleak - lowcomp;
+            if !(lfe_last && bin == 6) && bndpsd[bin] <= bndpsd[bin + 1] {
+                begin = bin + 1;
                 break;
             }
         }
+        for bin in begin..22.min(bndend) {
+            if !(lfe_last && bin == 6) {
+                lowcomp = calc_lowcomp(lowcomp, bndpsd[bin], bndpsd[bin + 1], bin);
+            }
+            fastleak -= fdecay;
+            fastleak = fastleak.max(bndpsd[bin] - fgain);
+            slowleak -= sdecay;
+            slowleak = slowleak.max(bndpsd[bin] - sgain);
+            excite[bin] = (fastleak - lowcomp).max(slowleak);
+        }
+        if bndend > 22 {
+            for bin in 22..bndend {
+                fastleak -= fdecay;
+                fastleak = fastleak.max(bndpsd[bin] - fgain);
+                slowleak -= sdecay;
+                slowleak = slowleak.max(bndpsd[bin] - sgain);
+                excite[bin] = fastleak.max(slowleak);
+            }
+        }
+        // Mask.
+        let hth_row = &HTH[fscod as usize];
+        let mut mask = [0i32; 50];
+        for bin in bndstrt..bndend {
+            let mut exc = excite[bin];
+            if bndpsd[bin] < dbknee {
+                exc += (dbknee - bndpsd[bin]) >> 2;
+            }
+            mask[bin] = exc.max(hth_row[bin] as i32);
+        }
+        // §7.2.2.6 delta bit allocation — apply BEFORE bap[] computation,
+        // exactly mirroring the decoder. The mask offsets in dba can be
+        // either negative (more bits assigned in that band) or positive
+        // (fewer bits — what our encoder picks by default to free budget
+        // for snroffst).
+        if let Some((plan, idx)) = dba {
+            apply_dba_segments(plan, idx, &mut mask);
+        }
+        Self {
+            psd,
+            mask,
+            start: 0,
+            end,
+            floor,
+        }
     }
-    // Excitation — fbw, non-coupled path.
-    let sdecay = SLOWDEC[ba.sdcycod as usize];
-    let fdecay = FASTDEC[ba.fdcycod as usize];
-    let sgain = SLOWGAIN[ba.sgaincod as usize];
-    let dbknee = DBPBTAB[ba.dbpbcod as usize];
-    let floor = FLOORTAB[ba.floorcod as usize];
-    let fgain = FASTGAIN[ba.fgaincod as usize];
-    let snroffset = (((ba.csnroffst as i32 - 15) << 4) + ba.fsnroffst as i32) << 2;
 
-    let mut excite = [0i32; 50];
-    let mut lowcomp = 0i32;
-    // §7.2.2.4 fbw path (start == 0). The `lfe_last` flag mirrors the
-    // decoder's same-named branch: when this channel is the LFE
-    // (end == 7), we skip the calc_lowcomp call at bin=6 so encoder
-    // and decoder derive the same excitation/mask/bap[] arrays.
-    let lfe_last = end == 7;
-    if bndend > 0 {
-        lowcomp = calc_lowcomp(lowcomp, bndpsd[0], bndpsd[1], 0);
-        excite[0] = bndpsd[0] - fgain - lowcomp;
-    }
-    if bndend > 1 {
-        lowcomp = calc_lowcomp(lowcomp, bndpsd[1], bndpsd[2], 1);
-        excite[1] = bndpsd[1] - fgain - lowcomp;
-    }
-    let mut begin = 7.min(bndend);
-    let mut fastleak = 0i32;
-    let mut slowleak = 0i32;
-    for bin in 2..7.min(bndend) {
-        if !(lfe_last && bin == 6) {
-            lowcomp = calc_lowcomp(lowcomp, bndpsd[bin], bndpsd[bin + 1], bin);
+    /// Coupling pseudo-channel, coefficients `start..end`
+    /// (`ba.fgaincod` is the coupling fast gain).
+    pub(crate) fn cpl(
+        exp: &[u8; N_COEFFS],
+        start: usize,
+        end: usize,
+        fscod: u8,
+        ba: &BitAllocParams,
+        dba: Option<(&DbaPlan, usize)>,
+    ) -> Self {
+        if end <= start {
+            return Self::empty();
         }
-        fastleak = bndpsd[bin] - fgain;
-        slowleak = bndpsd[bin] - sgain;
-        excite[bin] = fastleak - lowcomp;
-        if !(lfe_last && bin == 6) && bndpsd[bin] <= bndpsd[bin + 1] {
-            begin = bin + 1;
-            break;
+        let mut psd = [0i32; N_COEFFS];
+        for bin in start..end {
+            psd[bin] = 3072 - ((exp[bin] as i32) << 7);
         }
-    }
-    for bin in begin..22.min(bndend) {
-        if !(lfe_last && bin == 6) {
-            lowcomp = calc_lowcomp(lowcomp, bndpsd[bin], bndpsd[bin + 1], bin);
+        let bndstrt = MASKTAB[start] as usize;
+        let bndend = MASKTAB[end - 1] as usize + 1;
+        let mut bndpsd = [0i32; 50];
+        {
+            let mut j = start;
+            let mut k = bndstrt;
+            loop {
+                let lastbin = (BNDTAB[k] as usize + BNDSZ[k] as usize).min(end);
+                bndpsd[k] = psd[j];
+                j += 1;
+                while j < lastbin {
+                    bndpsd[k] = logadd(bndpsd[k], psd[j]);
+                    j += 1;
+                }
+                k += 1;
+                if end <= lastbin {
+                    break;
+                }
+            }
         }
-        fastleak -= fdecay;
-        fastleak = fastleak.max(bndpsd[bin] - fgain);
-        slowleak -= sdecay;
-        slowleak = slowleak.max(bndpsd[bin] - sgain);
-        excite[bin] = (fastleak - lowcomp).max(slowleak);
-    }
-    if bndend > 22 {
-        for bin in 22..bndend {
+        let sdecay = SLOWDEC[ba.sdcycod as usize];
+        let fdecay = FASTDEC[ba.fdcycod as usize];
+        let sgain = SLOWGAIN[ba.sgaincod as usize];
+        let dbknee = DBPBTAB[ba.dbpbcod as usize];
+        let floor = FLOORTAB[ba.floorcod as usize];
+        let fgain = FASTGAIN[ba.fgaincod as usize];
+        // §7.2.2.4 cpl path. cpl_fleak / cpl_sleak default to 0 (no
+        // cplleake transmitted), giving fastleak_init = slowleak_init = 0
+        // and the +768 offset applied in the decoder.
+        let mut fastleak = 768i32;
+        let mut slowleak = 768i32;
+        let mut excite = [0i32; 50];
+        for bin in bndstrt..bndend {
             fastleak -= fdecay;
             fastleak = fastleak.max(bndpsd[bin] - fgain);
             slowleak -= sdecay;
             slowleak = slowleak.max(bndpsd[bin] - sgain);
             excite[bin] = fastleak.max(slowleak);
         }
+        let hth_row = &HTH[fscod as usize];
+        let mut mask = [0i32; 50];
+        for bin in bndstrt..bndend {
+            let mut exc = excite[bin];
+            if bndpsd[bin] < dbknee {
+                exc += (dbknee - bndpsd[bin]) >> 2;
+            }
+            mask[bin] = exc.max(hth_row[bin] as i32);
+        }
+        // §7.2.2.6 dba — coupling-channel variant. The decoder applies the
+        // cpl-channel deltba segments to the same `mask[]` array before
+        // bap[] is computed, even though the cpl excitation path is the
+        // simpler `fastleak.max(slowleak)` branch.
+        if let Some((plan, idx)) = dba {
+            apply_dba_segments(plan, idx, &mut mask);
+        }
+        Self {
+            psd,
+            mask,
+            start,
+            end,
+            floor,
+        }
     }
-    // Mask.
-    let hth_row = &HTH[fscod as usize];
-    let mut mask = [0i32; 50];
-    for bin in bndstrt..bndend {
-        let mut exc = excite[bin];
-        if bndpsd[bin] < dbknee {
-            exc += (dbknee - bndpsd[bin]) >> 2;
+
+    /// The last allocation step: visit every coefficient's pointer for
+    /// the given SNR offset. `all_zero` is the §7.2.2.1.1 special case
+    /// (every transmitted SNR offset zero → every pointer 0).
+    #[inline]
+    fn for_each_bap(
+        &self,
+        all_zero: bool,
+        snroffset: i32,
+        ptr_tab: &[u8; 64],
+        mut visit: impl FnMut(usize, u8),
+    ) {
+        if self.end <= self.start {
+            return;
         }
-        mask[bin] = exc.max(hth_row[bin] as i32);
+        if all_zero {
+            for i in self.start..self.end {
+                visit(i, 0);
+            }
+            return;
+        }
+        let end = self.end;
+        let floor = self.floor;
+        let mut i = self.start;
+        let mut j = MASKTAB[self.start] as usize;
+        loop {
+            let lastbin = (BNDTAB[j] as usize + BNDSZ[j] as usize).min(end);
+            let mut m = self.mask[j];
+            m -= snroffset;
+            m -= floor;
+            if m < 0 {
+                m = 0;
+            }
+            m &= 0x1fe0;
+            m += floor;
+            while i < lastbin {
+                let addr = ((self.psd[i] - m) >> 5).clamp(0, 63) as usize;
+                visit(i, ptr_tab[addr]);
+                i += 1;
+            }
+            if i >= end {
+                break;
+            }
+            j += 1;
+        }
     }
-    // §7.2.2.6 delta bit allocation — apply BEFORE bap[] computation,
-    // exactly mirroring the decoder. The mask offsets in dba can be
-    // either negative (more bits assigned in that band) or positive
-    // (fewer bits — what our encoder picks by default to free budget
-    // for snroffst).
-    if let Some((plan, idx)) = dba {
-        apply_dba_segments(plan, idx, &mut mask);
+}
+
+/// Which pseudo-channel an [`AllocEval`] cell belongs to.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AllocSlot {
+    Fbw(usize),
+    Cpl,
+    Lfe,
+}
+
+/// One channel-block of an [`AllocEval`]: its masking state, and the
+/// pointer histogram of the SNR offset it was last asked for.
+struct AllocCell {
+    /// The mask-shaping parameters `masked` was built with.
+    mask_key: Option<[u8; 6]>,
+    masked: MaskedPsd,
+    /// `(all_zero, snroffset)` of `hist`.
+    hist_key: Option<(bool, i32)>,
+    hist: [u32; 16],
+}
+
+/// Mantissa-bit accounting for the encoder's SNR-offset searches.
+///
+/// The searches evaluate many `(csnroffst, fsnroffst)` candidates over
+/// the same exponents. This keeps, per channel and block, the masking
+/// curve (built once) and the histogram of allocation pointers for the
+/// offset currently selected (rebuilt only when that cell's offset
+/// changes), and counts the frame's mantissa bits from the histograms —
+/// the same total [`mantissa_bits_total_ends`] returns for the `bap[]`
+/// arrays [`compute_bap`] / [`compute_bap_cpl`] would have produced.
+pub(crate) struct AllocEval<'a> {
+    exps: &'a [Vec<[u8; N_COEFFS]>],
+    end: usize,
+    end_ch: Option<&'a [usize]>,
+    nchan: usize,
+    fscod: u8,
+    cpl: &'a CouplingPlan,
+    dba: &'a DbaPlan,
+    lfeon: bool,
+    blocks: usize,
+    /// `[slot][blk]`, slots `0..nchan` fbw, `nchan` coupling, `nchan + 1` LFE.
+    cells: Vec<AllocCell>,
+}
+
+impl<'a> AllocEval<'a> {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        exps: &'a [Vec<[u8; N_COEFFS]>],
+        end: usize,
+        end_ch: Option<&'a [usize]>,
+        nchan: usize,
+        fscod: u8,
+        cpl: &'a CouplingPlan,
+        dba: &'a DbaPlan,
+        lfeon: bool,
+    ) -> Self {
+        let blocks = exps.first().map_or(0, Vec::len);
+        let cells = (0..(nchan + 2) * blocks)
+            .map(|_| AllocCell {
+                mask_key: None,
+                masked: MaskedPsd::empty(),
+                hist_key: None,
+                hist: [0; 16],
+            })
+            .collect();
+        Self {
+            exps,
+            end,
+            end_ch,
+            nchan,
+            fscod,
+            cpl,
+            dba,
+            lfeon,
+            blocks,
+            cells,
+        }
     }
-    // bap.
-    let mut i = 0usize;
-    let mut j = MASKTAB[0] as usize;
-    loop {
-        let lastbin = (BNDTAB[j] as usize + BNDSZ[j] as usize).min(end);
-        let mut m = mask[j];
-        m -= snroffset;
-        m -= floor;
-        if m < 0 {
-            m = 0;
+
+    /// Select the SNR offset of one channel-block: `ba` is the parameter
+    /// set [`compute_bap`] (fbw / LFE) or [`compute_bap_cpl`] (coupling)
+    /// would have been called with for it.
+    pub(crate) fn select(&mut self, slot: AllocSlot, blk: usize, ba: &BitAllocParams) {
+        let (index, exps_slot) = match slot {
+            AllocSlot::Fbw(ch) => (ch, ch),
+            AllocSlot::Cpl => (self.nchan, self.nchan),
+            AllocSlot::Lfe => (self.nchan + 1, self.nchan + 1),
+        };
+        if blk >= self.blocks {
+            return;
         }
-        m &= 0x1fe0;
-        m += floor;
-        while i < lastbin {
-            let addr = ((psd[i] - m) >> 5).clamp(0, 63) as usize;
-            bap_out[i] = ptr_tab[addr];
-            i += 1;
+        let cell = &mut self.cells[index * self.blocks + blk];
+        let mask_key = [
+            ba.sdcycod,
+            ba.fdcycod,
+            ba.sgaincod,
+            ba.dbpbcod,
+            ba.floorcod,
+            ba.fgaincod,
+        ];
+        if cell.mask_key != Some(mask_key) {
+            let exp = &self.exps[exps_slot][blk];
+            cell.masked = match slot {
+                AllocSlot::Fbw(ch) => {
+                    let ch_end = self.end_ch.map_or(self.end, |e| e[ch]);
+                    MaskedPsd::fbw(exp, ch_end, self.fscod, ba, Some((self.dba, ch)))
+                }
+                AllocSlot::Cpl => MaskedPsd::cpl(
+                    exp,
+                    self.cpl.begf_mant(),
+                    self.cpl.endf_mant(),
+                    self.fscod,
+                    ba,
+                    Some((self.dba, MAX_FBW)),
+                ),
+                AllocSlot::Lfe => MaskedPsd::fbw(exp, LFE_END_MANT, self.fscod, ba, None),
+            };
+            cell.mask_key = Some(mask_key);
+            cell.hist_key = None;
         }
-        if i >= end {
-            break;
+        let hist_key = (ba.all_snr_offsets_zero(), ba.snroffset());
+        if cell.hist_key != Some(hist_key) {
+            let mut hist = [0u32; 16];
+            cell.masked
+                .for_each_bap(hist_key.0, hist_key.1, &BAPTAB, |_, bap| {
+                    hist[(bap & 15) as usize] += 1;
+                });
+            cell.hist = hist;
+            cell.hist_key = Some(hist_key);
         }
-        j += 1;
+    }
+
+    /// Pointer counts of block `blk` over every channel whose mantissas
+    /// the block carries.
+    fn block_hist(&self, blk: usize) -> [u32; 16] {
+        let mut total = [0u32; 16];
+        let mut add = |slot: usize| {
+            let cell = &self.cells[slot * self.blocks + blk];
+            if cell.hist_key.is_some() {
+                for (sum, count) in total.iter_mut().zip(&cell.hist) {
+                    *sum += count;
+                }
+            }
+        };
+        for ch in 0..self.nchan {
+            add(ch);
+        }
+        // The coupling channel's mantissas ride with the first coupled
+        // channel; without one they are not transmitted.
+        if self.cpl.in_use && (0..self.nchan).any(|ch| self.cpl.chincpl[ch]) {
+            add(self.nchan);
+        }
+        if self.lfeon {
+            add(self.nchan + 1);
+        }
+        total
+    }
+
+    /// Mantissa bits of the frame for the selected offsets. The bap 1 /
+    /// 2 / 4 mantissas are grouped across the channels of a block
+    /// (§7.3.5): three, three and two to a 5-, 7- and 7-bit group.
+    pub(crate) fn used(&self) -> u32 {
+        let mut total = 0u32;
+        for blk in 0..self.blocks {
+            let hist = self.block_hist(blk);
+            total += 5 * hist[1].div_ceil(3) + 7 * hist[2].div_ceil(3) + 7 * hist[4].div_ceil(2);
+            for bap in [3usize, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15] {
+                total += hist[bap] * QUANTIZATION_BITS[bap] as u32;
+            }
+        }
+        total
+    }
+
+    /// Six times a lower bound of [`used`](Self::used) that never
+    /// decreases when an SNR offset is raised: grouped mantissas are
+    /// charged their fractional share (5/3, 7/3, 7/2 bits) instead of
+    /// whole groups. Every pointer is non-decreasing in the SNR offset
+    /// and the per-mantissa charge is increasing in the pointer, so the
+    /// bound is monotone even though the exact, group-rounded count is
+    /// not.
+    pub(crate) fn used_lower_bound_x6(&self) -> u64 {
+        let mut total = 0u64;
+        for blk in 0..self.blocks {
+            let hist = self.block_hist(blk);
+            total += 10 * u64::from(hist[1]) + 14 * u64::from(hist[2]) + 21 * u64::from(hist[4]);
+            for bap in [3usize, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15] {
+                total += 6 * u64::from(hist[bap]) * u64::from(QUANTIZATION_BITS[bap]);
+            }
+        }
+        total
     }
 }
 
@@ -3185,88 +3688,14 @@ pub(crate) fn compute_bap_cpl(
         bap_out[start..end].fill(0);
         return;
     }
-    let mut psd = [0i32; N_COEFFS];
-    for bin in start..end {
-        psd[bin] = 3072 - ((exp[bin] as i32) << 7);
-    }
-    let bndstrt = MASKTAB[start] as usize;
-    let bndend = MASKTAB[end - 1] as usize + 1;
-    let mut bndpsd = [0i32; 50];
-    {
-        let mut j = start;
-        let mut k = bndstrt;
-        loop {
-            let lastbin = (BNDTAB[k] as usize + BNDSZ[k] as usize).min(end);
-            bndpsd[k] = psd[j];
-            j += 1;
-            while j < lastbin {
-                bndpsd[k] = logadd(bndpsd[k], psd[j]);
-                j += 1;
-            }
-            k += 1;
-            if end <= lastbin {
-                break;
-            }
-        }
-    }
-    let sdecay = SLOWDEC[ba.sdcycod as usize];
-    let fdecay = FASTDEC[ba.fdcycod as usize];
-    let sgain = SLOWGAIN[ba.sgaincod as usize];
-    let dbknee = DBPBTAB[ba.dbpbcod as usize];
-    let floor = FLOORTAB[ba.floorcod as usize];
-    let fgain = FASTGAIN[ba.fgaincod as usize];
-    let snroffset = (((ba.csnroffst as i32 - 15) << 4) + ba.fsnroffst as i32) << 2;
-    // §7.2.2.4 cpl path. cpl_fleak / cpl_sleak default to 0 (no
-    // cplleake transmitted), giving fastleak_init = slowleak_init = 0
-    // and the +768 offset applied in the decoder.
-    let mut fastleak = 768i32;
-    let mut slowleak = 768i32;
-    let mut excite = [0i32; 50];
-    for bin in bndstrt..bndend {
-        fastleak -= fdecay;
-        fastleak = fastleak.max(bndpsd[bin] - fgain);
-        slowleak -= sdecay;
-        slowleak = slowleak.max(bndpsd[bin] - sgain);
-        excite[bin] = fastleak.max(slowleak);
-    }
-    let hth_row = &HTH[fscod as usize];
-    let mut mask = [0i32; 50];
-    for bin in bndstrt..bndend {
-        let mut exc = excite[bin];
-        if bndpsd[bin] < dbknee {
-            exc += (dbknee - bndpsd[bin]) >> 2;
-        }
-        mask[bin] = exc.max(hth_row[bin] as i32);
-    }
-    // §7.2.2.6 dba — coupling-channel variant. The decoder applies the
-    // cpl-channel deltba segments to the same `mask[]` array before
-    // bap[] is computed, even though the cpl excitation path is the
-    // simpler `fastleak.max(slowleak)` branch.
-    if let Some((plan, idx)) = dba {
-        apply_dba_segments(plan, idx, &mut mask);
-    }
-    let mut i = start;
-    let mut j = MASKTAB[start] as usize;
-    loop {
-        let lastbin = (BNDTAB[j] as usize + BNDSZ[j] as usize).min(end);
-        let mut m = mask[j];
-        m -= snroffset;
-        m -= floor;
-        if m < 0 {
-            m = 0;
-        }
-        m &= 0x1fe0;
-        m += floor;
-        while i < lastbin {
-            let addr = ((psd[i] - m) >> 5).clamp(0, 63) as usize;
-            bap_out[i] = BAPTAB[addr];
-            i += 1;
-        }
-        if i >= end {
-            break;
-        }
-        j += 1;
-    }
+    MaskedPsd::cpl(exp, start, end, fscod, ba, dba).for_each_bap(
+        false,
+        ba.snroffset(),
+        &BAPTAB,
+        |i, bap| {
+            bap_out[i] = bap;
+        },
+    );
 }
 
 fn logadd(a: i32, b: i32) -> i32 {
@@ -3842,73 +4271,73 @@ pub(crate) fn tune_snroffst_with_plan_ends(
     // tie cplfsnr ≡ fsnr (the cpl pseudo-channel and the fbw channels
     // share the same sub-band SNR offset). This is sub-optimal but
     // adequate for an initial coupling-encode implementation.
+    let mut eval = AllocEval::new(exps, end, end_ch, nchan, fscod, cpl, dba, lfeon);
+    // Select the allocation of the frame-level candidate `cand` in every
+    // channel-block: the fbw channels with `cand` itself, the coupling
+    // and LFE pseudo-channels with their own fine offset and fast gain.
+    let select_frame = |eval: &mut AllocEval, cand: &BitAllocParams| {
+        for ch in 0..nchan {
+            for blk in 0..exps[ch].len() {
+                eval.select(AllocSlot::Fbw(ch), blk, cand);
+            }
+        }
+        if cpl.in_use {
+            let mut cpl_ba = *cand;
+            cpl_ba.fsnroffst = cand.cplfsnroffst;
+            cpl_ba.fgaincod = cand.cplfgaincod;
+            for blk in 0..exps[nchan].len() {
+                eval.select(AllocSlot::Cpl, blk, &cpl_ba);
+            }
+        }
+        if lfeon {
+            let mut lfe_ba = *cand;
+            lfe_ba.fsnroffst = cand.lfefsnroffst;
+            lfe_ba.fgaincod = cand.lfefgaincod;
+            for blk in 0..exps[nchan + 1].len() {
+                eval.select(AllocSlot::Lfe, blk, &lfe_ba);
+            }
+        }
+    };
+    let candidate = |combined: i32| {
+        let mut cand = *ba;
+        cand.csnroffst = (combined >> 4) as u8;
+        cand.fsnroffst = (combined & 15) as u8;
+        cand.cplfsnroffst = cand.fsnroffst;
+        cand.lfefsnroffst = cand.fsnroffst;
+        cand
+    };
+    // The answer is the LARGEST combined offset `16·csnroffst +
+    // fsnroffst` (0..=1023) whose mantissas fit the budget. The exact
+    // bit count is not monotone in the offset (group rounding), so the
+    // search is two-step: a bisection on the monotone lower bound finds
+    // the highest offset that can possibly fit — every offset above it
+    // is over budget by the bound alone — and a downward walk from
+    // there takes the first offset whose exact count fits. Same result
+    // as testing all 1024 offsets.
     let mut best = *ba;
     let mut best_offset: i32 = -1;
-    for csnr in 0..=63u8 {
-        for fsnr in 0..=15u8 {
-            let mut cand = *ba;
-            cand.csnroffst = csnr;
-            cand.fsnroffst = fsnr;
-            cand.cplfsnroffst = fsnr;
-            cand.lfefsnroffst = fsnr;
-            // baps slot layout: 0..nchan = fbw, nchan = cpl, nchan+1 = lfe.
-            let mut baps: Vec<Vec<[u8; N_COEFFS]>> =
-                vec![vec![[0u8; N_COEFFS]; exps[0].len()]; nchan + 2];
-            for ch in 0..nchan {
-                let ch_end = end_ch.map_or(end, |e| e[ch]);
-                for blk in 0..exps[ch].len() {
-                    compute_bap(
-                        &exps[ch][blk],
-                        ch_end,
-                        fscod,
-                        &cand,
-                        &mut baps[ch][blk],
-                        Some((dba, ch)),
-                    );
-                }
+    let budget_x6 = 6 * u64::from(budget);
+    let bound_fits = |combined: i32, eval: &mut AllocEval| {
+        select_frame(eval, &candidate(combined));
+        eval.used_lower_bound_x6() <= budget_x6
+    };
+    if bound_fits(0, &mut eval) {
+        let (mut low, mut high) = (0i32, 1023i32);
+        while low < high {
+            let mid = (low + high + 1) / 2;
+            if bound_fits(mid, &mut eval) {
+                low = mid;
+            } else {
+                high = mid - 1;
             }
-            if cpl.in_use {
-                let cpl_idx = nchan;
-                let begf_mant = cpl.begf_mant();
-                let endf_mant = cpl.endf_mant();
-                let mut cpl_ba = cand;
-                cpl_ba.fsnroffst = cand.cplfsnroffst;
-                cpl_ba.fgaincod = cand.cplfgaincod;
-                for blk in 0..exps[cpl_idx].len() {
-                    compute_bap_cpl(
-                        &exps[cpl_idx][blk],
-                        begf_mant,
-                        endf_mant,
-                        fscod,
-                        &cpl_ba,
-                        &mut baps[cpl_idx][blk],
-                        Some((dba, MAX_FBW)),
-                    );
-                }
-            }
-            if lfeon {
-                let lfe_idx = nchan + 1;
-                let mut lfe_ba = cand;
-                lfe_ba.fsnroffst = cand.lfefsnroffst;
-                lfe_ba.fgaincod = cand.lfefgaincod;
-                for blk in 0..exps[lfe_idx].len() {
-                    compute_bap(
-                        &exps[lfe_idx][blk],
-                        LFE_END_MANT,
-                        fscod,
-                        &lfe_ba,
-                        &mut baps[lfe_idx][blk],
-                        None,
-                    );
-                }
-            }
-            let used = mantissa_bits_total_ends(&baps, end, end_ch, nchan, cpl, lfeon);
-            if used <= budget {
-                let combined = (csnr as i32) * 16 + fsnr as i32;
-                if combined > best_offset {
-                    best_offset = combined;
-                    best = cand;
-                }
+        }
+        for combined in (0..=low).rev() {
+            let cand = candidate(combined);
+            select_frame(&mut eval, &cand);
+            if eval.used() <= budget {
+                best_offset = combined;
+                best = cand;
+                break;
             }
         }
     }
@@ -3961,60 +4390,31 @@ pub(crate) fn tune_snroffst_with_plan_ends(
     // We don't tune cplfsnroffst / lfefsnroffst per-channel here —
     // they're singletons in the bitstream syntax and the cpl/lfe
     // pseudo-channels don't need it for the current test inputs.
-    let recompute_used = |ba_in: &BitAllocParams| -> u32 {
-        let mut bps: Vec<Vec<[u8; N_COEFFS]>> =
-            vec![vec![[0u8; N_COEFFS]; exps[0].len()]; nchan + 2];
+    let mut recompute_used = |ba_in: &BitAllocParams| -> u32 {
         for ch in 0..nchan {
             let mut ch_ba = *ba_in;
             ch_ba.fsnroffst = ba_in.fsnroffst_ch[ch];
-            let ch_end = end_ch.map_or(end, |e| e[ch]);
             for blk in 0..exps[ch].len() {
-                compute_bap(
-                    &exps[ch][blk],
-                    ch_end,
-                    fscod,
-                    &ch_ba,
-                    &mut bps[ch][blk],
-                    Some((dba, ch)),
-                );
+                eval.select(AllocSlot::Fbw(ch), blk, &ch_ba);
             }
         }
         if cpl.in_use {
-            let cpl_idx = nchan;
-            let begf_mant = cpl.begf_mant();
-            let endf_mant = cpl.endf_mant();
             let mut cpl_ba = *ba_in;
             cpl_ba.fsnroffst = ba_in.cplfsnroffst;
             cpl_ba.fgaincod = ba_in.cplfgaincod;
-            for blk in 0..exps[cpl_idx].len() {
-                compute_bap_cpl(
-                    &exps[cpl_idx][blk],
-                    begf_mant,
-                    endf_mant,
-                    fscod,
-                    &cpl_ba,
-                    &mut bps[cpl_idx][blk],
-                    Some((dba, MAX_FBW)),
-                );
+            for blk in 0..exps[nchan].len() {
+                eval.select(AllocSlot::Cpl, blk, &cpl_ba);
             }
         }
         if lfeon {
-            let lfe_idx = nchan + 1;
             let mut lfe_ba = *ba_in;
             lfe_ba.fsnroffst = ba_in.lfefsnroffst;
             lfe_ba.fgaincod = ba_in.lfefgaincod;
-            for blk in 0..exps[lfe_idx].len() {
-                compute_bap(
-                    &exps[lfe_idx][blk],
-                    LFE_END_MANT,
-                    fscod,
-                    &lfe_ba,
-                    &mut bps[lfe_idx][blk],
-                    None,
-                );
+            for blk in 0..exps[nchan + 1].len() {
+                eval.select(AllocSlot::Lfe, blk, &lfe_ba);
             }
         }
-        mantissa_bits_total_ends(&bps, end, end_ch, nchan, cpl, lfeon)
+        eval.used()
     };
 
     // Per-channel greedy bumps, **least-served first with fairness
@@ -4374,48 +4774,28 @@ pub(crate) fn tune_per_block_snroffst_with_plan(
     // Helper: compute current total mantissa bits across all blocks
     // under the current `plan`, plus per-block snroffste overhead
     // delta vs the pre-#170 baseline (block-0-only emission).
+    // The redistribution always walks every fbw channel to the common
+    // `end` (the per-block tuner predates per-channel bandwidths).
+    let eval = std::cell::RefCell::new(AllocEval::new(
+        exps, end, None, nchan, fscod, cpl, dba, lfeon,
+    ));
     let recompute = |plan: &PerBlockSnr| -> u32 {
-        let mut bps: Vec<Vec<[u8; N_COEFFS]>> =
-            vec![vec![[0u8; N_COEFFS]; exps[0].len()]; nchan + 2];
+        let mut eval = eval.borrow_mut();
         for blk in 0..BLOCKS_PER_FRAME {
             for ch in 0..nchan {
                 let ch_ba = plan.ba_for_fbw(ba, blk, ch);
-                compute_bap(
-                    &exps[ch][blk],
-                    end,
-                    fscod,
-                    &ch_ba,
-                    &mut bps[ch][blk],
-                    Some((dba, ch)),
-                );
+                eval.select(AllocSlot::Fbw(ch), blk, &ch_ba);
             }
             if cpl.in_use {
-                let cpl_idx = nchan;
                 let cpl_ba = plan.ba_for_cpl(ba, blk);
-                compute_bap_cpl(
-                    &exps[cpl_idx][blk],
-                    cpl.begf_mant(),
-                    cpl.endf_mant(),
-                    fscod,
-                    &cpl_ba,
-                    &mut bps[cpl_idx][blk],
-                    Some((dba, MAX_FBW)),
-                );
+                eval.select(AllocSlot::Cpl, blk, &cpl_ba);
             }
             if lfeon {
-                let lfe_idx = nchan + 1;
                 let lfe_ba = plan.ba_for_lfe(ba, blk);
-                compute_bap(
-                    &exps[lfe_idx][blk],
-                    LFE_END_MANT,
-                    fscod,
-                    &lfe_ba,
-                    &mut bps[lfe_idx][blk],
-                    None,
-                );
+                eval.select(AllocSlot::Lfe, blk, &lfe_ba);
             }
         }
-        mantissa_bits_total(&bps, end, nchan, cpl, lfeon)
+        eval.used()
     };
 
     // Per-block snroffste overhead bits when set to 1 (block 0 was
@@ -5048,14 +5428,50 @@ impl CouplingPlan {
         }
     }
 
+    /// Build a coupling plan describing an Annex E **standard
+    /// coupling** region (`ecplinu = 0`, §E.2.3.3.14-15) for the shared
+    /// tuner / bit-accounting machinery: sub-bands `cplbegf ..
+    /// cplbegf + nsubbnd` with the merge flags `bndstrc` (indexed by
+    /// the offset from `cplbegf`, entry 0 always `false`). `nsubbnd`
+    /// carries the region end directly because the SPX-derived
+    /// `cplendf` may be negative (Table E1.4 note). The coordinate
+    /// fields stay at their defaults — the E-AC-3 encoder plans and
+    /// emits its own per-span coordinates.
+    pub(crate) fn for_eac3_standard(
+        begf: u8,
+        nsubbnd: usize,
+        bndstrc: &[bool; 18],
+        nfchans: usize,
+    ) -> Self {
+        debug_assert!(nsubbnd >= 1 && begf as usize + nsubbnd <= 18);
+        let mut chincpl = [false; MAX_FBW];
+        for slot in chincpl.iter_mut().take(nfchans.min(MAX_FBW)) {
+            *slot = true;
+        }
+        let merged = bndstrc[1..nsubbnd].iter().filter(|&&m| m).count();
+        Self {
+            in_use: true,
+            begf,
+            endf: (begf as usize + nsubbnd).saturating_sub(3) as u8,
+            chincpl,
+            bndstrc: *bndstrc,
+            nsubbnd,
+            nbnd: nsubbnd - merged,
+            ..Self::default()
+        }
+    }
+
     /// Mantissa-domain inclusive lower bound of coupling region.
     fn begf_mant(&self) -> usize {
         37 + 12 * self.begf as usize
     }
     /// Mantissa-domain exclusive upper bound (matches the decoder's
-    /// `cpl_endf_mant = 37 + 12*(cplendf + 3)`).
+    /// `cpl_endf_mant = 37 + 12*(cplendf + 3)`). Computed from the
+    /// sub-band count (`ncplsubnd = 3 + cplendf - cplbegf`, §5.4.3.12)
+    /// so the Annex E SPX-derived `cplendf`, which may be negative
+    /// (Table E1.4 note), is representable.
     fn endf_mant(&self) -> usize {
-        37 + 12 * (self.endf as usize + 3)
+        37 + 12 * (self.begf as usize + self.nsubbnd)
     }
     /// Build the `subband -> band` lookup table. Same logic as the
     /// decoder so encoder + decoder agree on per-band coordinate
@@ -5302,7 +5718,7 @@ pub(crate) fn build_dba_plan(
 ///
 /// Returns `(cplcoexp, cplcomant)`. For `cplco ≤ 0` (silent band),
 /// returns the "all silent" code `(15, 0)` which decodes to 0.
-fn quantise_cplco(cplco: f32, mstrcplco: u8) -> (u8, u8) {
+pub(crate) fn quantise_cplco(cplco: f32, mstrcplco: u8) -> (u8, u8) {
     if cplco <= 0.0 || !cplco.is_finite() {
         return (15, 0);
     }
@@ -5349,7 +5765,7 @@ fn quantise_cplco(cplco: f32, mstrcplco: u8) -> (u8, u8) {
 ///
 /// Loud bands ⇒ small total shift ⇒ mstrcplco = 0.
 /// Quiet bands ⇒ large total shift ⇒ mstrcplco grows.
-fn pick_mstrcplco(max_cplco: f32) -> u8 {
+pub(crate) fn pick_mstrcplco(max_cplco: f32) -> u8 {
     if max_cplco >= 1.0 {
         return 0;
     }
@@ -5358,7 +5774,7 @@ fn pick_mstrcplco(max_cplco: f32) -> u8 {
     }
     let lg = max_cplco.log2();
     let need_shift = (-(lg.floor()) as i32) - 1; // total shift for the loudest band
-                                                 // We want need_shift - 3*mstr ∈ 0..15; minimise mstr.
+    // We want need_shift - 3*mstr ∈ 0..15; minimise mstr.
     let need_shift = need_shift.max(0);
     let mstr = (need_shift - 14).max(0); // ensure cplcoexp ≤ 14
     let mstr = mstr.div_euclid(3) + i32::from(mstr.rem_euclid(3) > 0);
@@ -5368,7 +5784,7 @@ fn pick_mstrcplco(max_cplco: f32) -> u8 {
 /// Reconstruct the linear coupling coordinate from its quantised
 /// (cplcoexp, cplcomant, mstrcplco) representation. Mirrors the
 /// decoder's `state.cpl_coord = mant * 2^(-shift)` formula.
-fn reconstruct_cplco(cplcoexp: u8, cplcomant: u8, mstrcplco: u8) -> f32 {
+pub(crate) fn reconstruct_cplco(cplcoexp: u8, cplcomant: u8, mstrcplco: u8) -> f32 {
     let mant = if cplcoexp == 15 {
         cplcomant as f32 / 16.0
     } else {
@@ -5407,6 +5823,156 @@ mod tests {
             }
         }
         out
+    }
+
+    /// `AllocEval` is the pair `compute_bap` / `compute_bap_cpl` +
+    /// `mantissa_bits_total_ends` computed incrementally: for random
+    /// exponent sets, coupling on and off, with and without an LFE and
+    /// across the whole SNR-offset range it returns the same bit count,
+    /// and its lower bound is a monotone floor of it.
+    #[test]
+    fn alloc_eval_matches_the_reference_bit_count() {
+        // Table 7.16 must be monotone for the lower-bound argument.
+        assert!(BAPTAB.windows(2).all(|pair| pair[0] <= pair[1]));
+
+        let mut seed = 0x2545_f491_u32;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed
+        };
+        let base = BitAllocParams {
+            sdcycod: 2,
+            fdcycod: 1,
+            sgaincod: 1,
+            dbpbcod: 2,
+            floorcod: 4,
+            csnroffst: 0,
+            fsnroffst: 0,
+            fsnroffst_ch: [0u8; MAX_FBW],
+            cplfsnroffst: 0,
+            lfefsnroffst: 0,
+            fgaincod: 4,
+            cplfgaincod: 3,
+            lfefgaincod: 5,
+        };
+        for round in 0..24 {
+            let nchan = 1 + round % 5;
+            let lfeon = round % 2 == 0;
+            let fscod = (round % 3) as u8;
+            let cpl = if nchan >= 2 && round % 3 != 0 {
+                let mut plan = CouplingPlan {
+                    in_use: true,
+                    begf: (round % 6) as u8,
+                    endf: 9,
+                    ..CouplingPlan::default()
+                };
+                plan.nsubbnd = 3 + plan.endf as usize - plan.begf as usize;
+                for ch in 0..nchan {
+                    // Leave the first channel out now and then.
+                    plan.chincpl[ch] = !(ch == 0 && round % 4 == 1);
+                }
+                plan
+            } else {
+                CouplingPlan::default()
+            };
+            let end = if cpl.in_use {
+                cpl.begf_mant()
+            } else {
+                200 + round
+            };
+            let ends: Vec<usize> = (0..nchan).map(|ch| end - 12 * (ch % 3)).collect();
+            let end_ch = (round % 2 == 1 && !cpl.in_use).then_some(&ends[..]);
+            // Smooth-ish random exponents, a different envelope per block.
+            let exps: Vec<Vec<[u8; N_COEFFS]>> = (0..nchan + 2)
+                .map(|_| {
+                    (0..BLOCKS_PER_FRAME)
+                        .map(|_| {
+                            let mut e = [24u8; N_COEFFS];
+                            let mut level = 4 + (next() % 12) as i32;
+                            for value in e.iter_mut() {
+                                level = (level + (next() % 5) as i32 - 2).clamp(0, 24);
+                                *value = level as u8;
+                            }
+                            e
+                        })
+                        .collect()
+                })
+                .collect();
+            let dba = DbaPlan::default();
+            let mut eval = AllocEval::new(&exps, end, end_ch, nchan, fscod, &cpl, &dba, lfeon);
+            let mut previous_bound = 0u64;
+            for combined in (0..1024).step_by(7).chain([1023]) {
+                let mut cand = base;
+                cand.csnroffst = (combined >> 4) as u8;
+                cand.fsnroffst = (combined & 15) as u8;
+                cand.cplfsnroffst = cand.fsnroffst;
+                cand.lfefsnroffst = cand.fsnroffst;
+                // Every third offset gives one channel its own fine offset.
+                let own = (combined % 3 == 0).then_some(((combined / 3) & 15) as u8);
+                let mut cpl_ba = cand;
+                cpl_ba.fsnroffst = cand.cplfsnroffst;
+                cpl_ba.fgaincod = cand.cplfgaincod;
+                let mut lfe_ba = cand;
+                lfe_ba.fsnroffst = cand.lfefsnroffst;
+                lfe_ba.fgaincod = cand.lfefgaincod;
+
+                let mut baps: Vec<Vec<[u8; N_COEFFS]>> =
+                    vec![vec![[0u8; N_COEFFS]; BLOCKS_PER_FRAME]; nchan + 2];
+                for blk in 0..BLOCKS_PER_FRAME {
+                    for ch in 0..nchan {
+                        let mut ch_ba = cand;
+                        if let (Some(fine), 0) = (own, ch) {
+                            ch_ba.fsnroffst = fine;
+                        }
+                        let ch_end = end_ch.map_or(end, |e| e[ch]);
+                        compute_bap(
+                            &exps[ch][blk],
+                            ch_end,
+                            fscod,
+                            &ch_ba,
+                            &mut baps[ch][blk],
+                            Some((&dba, ch)),
+                        );
+                        eval.select(AllocSlot::Fbw(ch), blk, &ch_ba);
+                    }
+                    if cpl.in_use {
+                        compute_bap_cpl(
+                            &exps[nchan][blk],
+                            cpl.begf_mant(),
+                            cpl.endf_mant(),
+                            fscod,
+                            &cpl_ba,
+                            &mut baps[nchan][blk],
+                            Some((&dba, MAX_FBW)),
+                        );
+                        eval.select(AllocSlot::Cpl, blk, &cpl_ba);
+                    }
+                    if lfeon {
+                        compute_bap(
+                            &exps[nchan + 1][blk],
+                            LFE_END_MANT,
+                            fscod,
+                            &lfe_ba,
+                            &mut baps[nchan + 1][blk],
+                            None,
+                        );
+                        eval.select(AllocSlot::Lfe, blk, &lfe_ba);
+                    }
+                }
+                let reference = mantissa_bits_total_ends(&baps, end, end_ch, nchan, &cpl, lfeon);
+                assert_eq!(eval.used(), reference, "round {round} offset {combined}");
+                let bound = eval.used_lower_bound_x6();
+                assert!(bound <= 6 * u64::from(reference));
+                // Group rounding adds at most 4 + 6 + 3 bits per block.
+                assert!(6 * u64::from(reference) <= bound + 6 * 13 * BLOCKS_PER_FRAME as u64);
+                if own.is_none() {
+                    assert!(bound >= previous_bound, "round {round} offset {combined}");
+                    previous_bound = bound;
+                }
+            }
+        }
     }
 
     /// Walk the decoder's grouped-exponent reconstruction (matches
@@ -5776,8 +6342,8 @@ mod tests {
             dec.send_packet(p).unwrap();
             match dec.receive_frame() {
                 Ok(Frame::Audio(a)) => {
-                    let plane = &s16_interleaved(&a);
-                    for s in plane.chunks_exact(4) {
+                    let plane = s16_interleaved(&a);
+                    for s in plane.as_chunks::<4>().0 {
                         let l = i16::from_le_bytes([s[0], s[1]]);
                         decoded_samples_left.push(l);
                     }
@@ -5987,7 +6553,7 @@ mod tests {
         for p in &pkts {
             dec.send_packet(p).unwrap();
             if let Ok(Frame::Audio(a)) = dec.receive_frame() {
-                for s in s16_interleaved(&a).chunks_exact(4) {
+                for s in s16_interleaved(&a).as_chunks::<4>().0 {
                     decoded.push(i16::from_le_bytes([s[0], s[1]]));
                 }
             }
@@ -6177,7 +6743,9 @@ mod tests {
             decoded_bytes.len()
         );
         let dsq: f64 = decoded_bytes
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|c| {
                 let l = i16::from_le_bytes([c[0], c[1]]) as f64;
                 l * l
@@ -6288,7 +6856,9 @@ mod tests {
             decoded_bytes.len()
         );
         let dsq: f64 = decoded_bytes
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|c| {
                 let l = i16::from_le_bytes([c[0], c[1]]) as f64;
                 l * l
@@ -6369,7 +6939,7 @@ mod tests {
         for p in &pkts {
             dec.send_packet(p).unwrap();
             if let Ok(Frame::Audio(a)) = dec.receive_frame() {
-                for s in s16_interleaved(&a).chunks_exact(4) {
+                for s in s16_interleaved(&a).as_chunks::<4>().0 {
                     decoded.push(i16::from_le_bytes([s[0], s[1]]));
                 }
             }
@@ -6449,7 +7019,9 @@ mod tests {
             decoded_bytes.len()
         );
         let dsq: f64 = decoded_bytes
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|c| {
                 let l = i16::from_le_bytes([c[0], c[1]]) as f64;
                 l * l
@@ -6557,7 +7129,7 @@ mod tests {
         for p in &pkts {
             dec.send_packet(p).unwrap();
             if let Ok(Frame::Audio(a)) = dec.receive_frame() {
-                for s in s16_interleaved(&a).chunks_exact(4) {
+                for s in s16_interleaved(&a).as_chunks::<4>().0 {
                     decoded.push(i16::from_le_bytes([s[0], s[1]]));
                 }
             }
@@ -6649,7 +7221,9 @@ mod tests {
             decoded_bytes.len()
         );
         let dsq: f64 = decoded_bytes
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|c| {
                 let l = i16::from_le_bytes([c[0], c[1]]) as f64;
                 l * l
@@ -6752,7 +7326,7 @@ mod tests {
         for p in &pkts {
             dec.send_packet(p).unwrap();
             if let Ok(Frame::Audio(a)) = dec.receive_frame() {
-                for s in s16_interleaved(&a).chunks_exact(4) {
+                for s in s16_interleaved(&a).as_chunks::<4>().0 {
                     decoded.push(i16::from_le_bytes([s[0], s[1]]));
                 }
             }
@@ -6814,7 +7388,9 @@ mod tests {
             decoded_bytes.len()
         );
         let dsq: f64 = decoded_bytes
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|c| {
                 let l = i16::from_le_bytes([c[0], c[1]]) as f64;
                 l * l
@@ -6915,7 +7491,7 @@ mod tests {
         for p in &pkts {
             dec.send_packet(p).unwrap();
             if let Ok(Frame::Audio(a)) = dec.receive_frame() {
-                for s in s16_interleaved(&a).chunks_exact(2) {
+                for s in s16_interleaved(&a).as_chunks::<2>().0 {
                     decoded.push(i16::from_le_bytes([s[0], s[1]]));
                 }
             }
@@ -7138,7 +7714,7 @@ mod tests {
         let (nsamp, bytes) = build_multichan_pcm(channels, sr, dur, 220.0);
         // Reconstruct the source PCM as f32 / i16 for the PSNR baseline.
         let mut src_i16: Vec<i16> = Vec::with_capacity(nsamp * channels as usize);
-        for c in bytes.chunks_exact(2) {
+        for c in bytes.as_chunks::<2>().0 {
             src_i16.push(i16::from_le_bytes([c[0], c[1]]));
         }
 
@@ -7174,7 +7750,7 @@ mod tests {
         for p in &pkts {
             dec.send_packet(p).unwrap();
             if let Ok(Frame::Audio(a)) = dec.receive_frame() {
-                for s in s16_interleaved(&a).chunks_exact(2) {
+                for s in s16_interleaved(&a).as_chunks::<2>().0 {
                     decoded.push(i16::from_le_bytes([s[0], s[1]]));
                 }
             }
@@ -7327,7 +7903,7 @@ mod tests {
         for p in &pkts {
             dec.send_packet(p).unwrap();
             if let Ok(Frame::Audio(a)) = dec.receive_frame() {
-                for s in s16_interleaved(&a).chunks_exact(2) {
+                for s in s16_interleaved(&a).as_chunks::<2>().0 {
                     decoded.push(i16::from_le_bytes([s[0], s[1]]));
                 }
             }
@@ -7453,7 +8029,9 @@ mod tests {
         let skip = 768usize.min(frames);
         let usable = frames.saturating_sub(skip);
         let samples: Vec<i16> = decoded_bytes
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| i16::from_le_bytes([c[0], c[1]]))
             .collect();
         let mut per_ch_rms = vec![0.0f64; nch];
@@ -7559,7 +8137,9 @@ mod tests {
         let skip = 768usize.min(frames);
         let usable = frames.saturating_sub(skip);
         let samples: Vec<i16> = decoded_bytes
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| i16::from_le_bytes([c[0], c[1]]))
             .collect();
         let mut per_ch_rms = vec![0.0f64; nch];
@@ -7593,7 +8173,9 @@ mod tests {
         let src_to_ffmpeg = [0usize, 2, 1, 4, 5, 3];
         let (_nsamp_src, src_bytes) = build_multichan_pcm(channels, sr, 0.5, 220.0);
         let src_samples: Vec<i16> = src_bytes
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| i16::from_le_bytes([c[0], c[1]]))
             .collect();
         for src_ch in 0..nch {
@@ -7711,7 +8293,7 @@ mod tests {
     /// Round-25 (task #155): demonstrate the bit-savings of multichan
     /// coupling on HF-rich content. Encode a 5.1 fixture twice — once
     /// with all 5 fbw channels coupled (the default), and once with
-    /// `AC3_DISABLE_CPL` set so coupling is suppressed — at the same
+    /// the `cpl = 0` option so coupling is suppressed — at the same
     /// nominal bitrate, and verifies the coupling tool engages
     /// end-to-end without regressing the decode.
     ///
@@ -7737,19 +8319,16 @@ mod tests {
     ///
     ///  1. coupling-on must *engage* — at least one block emits
     ///     `cplinu = 1` in the bitstream side-info;
-    ///  2. coupling-off (`AC3_DISABLE_CPL`) must emit `cplinu = 0` in
+    ///  2. coupling-off (`cpl = 0`) must emit `cplinu = 0` in
     ///     every block;
     ///  3. both paths produce a *valid, non-degraded* self-decode at or
     ///     above the same per-channel floor the rest of the 5.1 suite
     ///     uses — i.e. coupling does not *regress* the decode;
     ///  4. at matched `frmsizecod` the two bitstreams are the same size.
     ///
-    /// Still `#[ignore]`d because it mutates the process-wide
-    /// `AC3_DISABLE_CPL` env var and would race a concurrently-running
-    /// encode; run alone with `cargo test -- --ignored
-    /// five_one_coupling_beats_no_coupling_at_low_bitrate`.
+    /// The no-coupling arm uses the construction-time `cpl = 0` option,
+    /// so the test shares the process with the rest of the suite.
     #[test]
-    #[ignore = "mutates AC3_DISABLE_CPL — must run alone (cargo test -- --ignored)"]
     fn five_one_coupling_beats_no_coupling_at_low_bitrate() {
         // 320 kbps for 5.1 — below the 448 kbps default, the budget at
         // which coupling is most relevant.
@@ -7762,19 +8341,14 @@ mod tests {
         // Returns (avg-fbw PSNR, bitstream byte count, count of blocks
         // whose side-info carried `cplinu == 1`, total blocks).
         let encode_and_psnr = |disable_cpl: bool| -> (f64, usize, usize, usize) {
-            // Switch the env knob inside this closure; restore on exit.
-            // The encoder reads `AC3_DISABLE_CPL` per frame so setting
-            // it before the encode loop is sufficient.
-            if disable_cpl {
-                std::env::set_var("AC3_DISABLE_CPL", "1");
-            } else {
-                std::env::remove_var("AC3_DISABLE_CPL");
-            }
             let mut params = CodecParameters::audio(CodecId::new("ac3"));
             params.sample_rate = Some(sr);
             params.channels = Some(channels);
             params.sample_format = Some(SampleFormat::S16);
             params.bit_rate = Some(kbps * 1000);
+            if disable_cpl {
+                params.options.insert("cpl".to_string(), "0".to_string());
+            }
             let mut enc = make_encoder(&params).expect("make_encoder");
             enc.send_frame(&Frame::Audio(AudioFrame {
                 samples: nsamp as u32,
@@ -7838,7 +8412,7 @@ mod tests {
                 );
                 dec.send_packet(&pkt).unwrap();
                 if let Ok(Frame::Audio(a)) = dec.receive_frame() {
-                    for s in s16_interleaved(&a).chunks_exact(2) {
+                    for s in s16_interleaved(&a).as_chunks::<2>().0 {
                         decoded.push(i16::from_le_bytes([s[0], s[1]]));
                     }
                 }
@@ -7852,7 +8426,9 @@ mod tests {
             let skip = 768usize.min(frames_decoded);
             let usable = frames_decoded.saturating_sub(skip);
             let src_samples: Vec<i16> = bytes
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|c| i16::from_le_bytes([c[0], c[1]]))
                 .collect();
             let mut total_psnr = 0.0f64;
@@ -7888,8 +8464,6 @@ mod tests {
 
         let (psnr_with, bytes_with, cpl_blocks_with, total_blocks) = encode_and_psnr(false);
         let (psnr_without, bytes_without, cpl_blocks_without, _) = encode_and_psnr(true);
-        // Restore env state.
-        std::env::remove_var("AC3_DISABLE_CPL");
 
         eprintln!(
             "5.1 @ {} kbps coupling-on  : avg-fbw PSNR {:.2} dB ({} bytes, {}/{} cpl blocks)",
@@ -7920,7 +8494,7 @@ mod tests {
         // (2) Coupling-off must suppress the tool in every block.
         assert_eq!(
             cpl_blocks_without, 0,
-            "AC3_DISABLE_CPL still emitted {}/{} coupled blocks",
+            "cpl = 0 still emitted {}/{} coupled blocks",
             cpl_blocks_without, total_blocks
         );
         // (3) Coupling must not *regress* the decode: the coupling-on
@@ -8050,12 +8624,9 @@ mod tests {
     /// per-block-tuned run must produce equal-or-better localised
     /// PSNR over block 3's sample range.
     ///
-    /// Marked `#[ignore]` so it doesn't race with other tests over the
-    /// `AC3_DISABLE_PERBLOCK_SNR` env var (set/remove here would flip
-    /// the encoder's decision in any concurrently-running encode).
-    /// Run with `cargo test -- --ignored perblock_snroffst_helps_transient`.
+    /// The flat arm uses the construction-time `perblock_snr = 0`
+    /// option, so the test shares the process with the rest of the suite.
     #[test]
-    #[ignore = "mutates AC3_DISABLE_PERBLOCK_SNR — must run alone (cargo test -- --ignored)"]
     fn perblock_snroffst_helps_transient() {
         let sr = 48_000u32;
         let (nsamp, bytes) = build_perblock_transient_pcm(sr);
@@ -8068,16 +8639,16 @@ mod tests {
         let kbps = 96u64;
 
         let encode_and_psnr = |disable: bool| -> (f64, usize) {
-            if disable {
-                std::env::set_var("AC3_DISABLE_PERBLOCK_SNR", "1");
-            } else {
-                std::env::remove_var("AC3_DISABLE_PERBLOCK_SNR");
-            }
             let mut params = CodecParameters::audio(CodecId::new("ac3"));
             params.sample_rate = Some(sr);
             params.channels = Some(2);
             params.sample_format = Some(SampleFormat::S16);
             params.bit_rate = Some(kbps * 1000);
+            if disable {
+                params
+                    .options
+                    .insert("perblock_snr".to_string(), "0".to_string());
+            }
             let mut enc = make_encoder(&params).expect("make_encoder");
             let audio = AudioFrame {
                 samples: nsamp as u32,
@@ -8104,13 +8675,15 @@ mod tests {
             for p in &pkts {
                 dec.send_packet(p).unwrap();
                 while let Ok(Frame::Audio(a)) = dec.receive_frame() {
-                    for s in s16_interleaved(&a).chunks_exact(4) {
+                    for s in s16_interleaved(&a).as_chunks::<4>().0 {
                         decoded.push(i16::from_le_bytes([s[0], s[1]]));
                     }
                 }
             }
             let orig: Vec<i16> = bytes
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .map(|c| i16::from_le_bytes([c[0], c[1]]))
                 .collect();
             let n = decoded.len().min(orig.len());
@@ -8168,7 +8741,8 @@ mod tests {
 
         let (psnr_with, bytes_with) = encode_and_psnr(false);
         let (psnr_without, bytes_without) = encode_and_psnr(true);
-        std::env::remove_var("AC3_DISABLE_PERBLOCK_SNR");
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("AC3_DISABLE_PERBLOCK_SNR") };
 
         eprintln!(
             "block-3 transient @ {} kbps: per-block-tuned  = {:.2} dB ({} bytes)",
@@ -8337,7 +8911,7 @@ mod tests {
         for p in pkts {
             dec.send_packet(p).unwrap();
             while let Ok(Frame::Audio(a)) = dec.receive_frame() {
-                for s in s16_interleaved(&a).chunks_exact(2) {
+                for s in s16_interleaved(&a).as_chunks::<2>().0 {
                     out.push(i16::from_le_bytes([s[0], s[1]]));
                 }
             }
@@ -8581,7 +9155,9 @@ mod tests {
         let bytes = std::fs::read(&out_path).expect("ffmpeg output");
         let _ = std::fs::remove_file(&out_path);
         let samples: Vec<i16> = bytes
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| i16::from_le_bytes([c[0], c[1]]))
             .collect();
         // Skip the first frame's worth of samples (priming edge).

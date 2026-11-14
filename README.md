@@ -32,7 +32,8 @@ slice of §5..§7 (base AC-3) or §E (E-AC-3):
    (`acmod ∈ {3, 5, 7}`).
 7. [`encoder`] — base AC-3 encoder.
 8. [`eac3`] — Annex E decoder + encoder, including opt-in JOC/OAMD
-   object reconstruction and stereo speaker rendering.
+   object reconstruction and rendering to a selectable speaker layout
+   (stereo … 9.1.6).
 9. [`crc`] — §7.10.1 CRC-16 over poly 0x8005, shared between the encoder
    and the opt-in `decoder::verify_packet_crc` residue check.
 10. [`drc`] — §6.1.9 / §7.6 / §7.7 dynamic-range-control + dialogue-
@@ -89,9 +90,17 @@ downmixed to the container's channel count. What it covers:
   normalisation (an opt-in playback scalar `10^((target − dialnorm)/20)`
   toward a chosen headroom target). Build a configured decoder with
   `decoder::make_decoder_with_drc(params, DrcSettings)`. Applies to both
-  the AC-3 and E-AC-3 paths.
+  the AC-3 and E-AC-3 paths. The resolved block gain scales every
+  reproduced channel including the LFE (§5.4.3.4 / §6.1.9; only 1+1
+  mode splits the program into `dynrng` / `dynrng2`), pinned by
+  `tests/dynrng_lfe.rs` against Table 7.29.
 - Downmix (§7.8) — LoRo and LtRt 2-channel.
 - Bitstream → WAV channel reorder for multichannel layouts.
+- Output format: interleaved S16LE by default; a decoder built with
+  `CodecParameters::sample_format = Some(SampleFormat::F32)` emits the
+  same channels as interleaved little-endian f32, unquantised (the S16
+  output is exactly that f32 output truncated to 16 bits). Both the
+  AC-3 and E-AC-3 paths (passthrough, downmix, JOC stereo) honour it.
 
 ### AC-3 encoder
 
@@ -107,6 +116,11 @@ downmixed to the container's channel count. What it covers:
   (§5.4.3.40), per-block SNR-offset bit-pool redistribution, the
   §7.2.2.1.1 all-zero-offset special case mirrored in the allocator,
   and §7.10.1 dual-CRC emission.
+- A/B knobs for the two encoder tools whose contribution the suite
+  measures: options `cpl = 0` (no §7.4 coupling) and `perblock_snr = 0`
+  (flat frame-level SNR offsets), read once at construction; the
+  `AC3_DISABLE_CPL` / `AC3_DISABLE_PERBLOCK_SNR` environment variables
+  remain as the legacy switch.
 - **Bitstream-metadata surface** (`encoder::MetadataParams` /
   `make_encoder_with_metadata`, or the registry options `dialnorm`,
   `compr`, `dynrng`, `bsmod`, `cmixlev`, `surmixlev`, `dsurmod`,
@@ -186,26 +200,96 @@ downmixed to the container's channel count. What it covers:
   `blkstrtinfo` width (16-bit words through ceiling-log2, formerly
   frame bits through floor-log2+1), and the per-block `fgaincod`
   default reset. The class is pinned by hand-written spec-conformant
-  syncframes (SPX + coupling co-active — a geometry no available
-  encoder produces) that ffmpeg accepts and both decoders agree on at
-  ~92 dB, by a decode-side ffmpeg conformance harness
+  syncframes (SPX + coupling co-active) that ffmpeg accepts and both
+  decoders agree on at ~92 dB, by our encoder now emitting that
+  geometry (standard coupling, below), by a decode-side ffmpeg conformance harness
   (`tests/eac3_decode_ffmpeg.rs`: ffmpeg-generated streams across
   rates/modes/coupling/metadata + our-encoder broadcast BSI shapes,
   ≥ 50 dB per channel), and by an env-gated local-vector gate
   (`OXIDEAV_AC3_LOCAL_EAC3=/path` runs the same PSNR gate on captures
   that cannot be committed). Zero-fill fallbacks are now countable via
   `Eac3DecoderState::frames_zero_filled`, so callers can tell decoder
-  dropouts from silent program audio.
-- **Opt-in JOC object presentation**
-  (`decoder::make_eac3_decoder_with_joc`) parses EC-3 Extension Type A
+  dropouts from silent program audio. The harness also carries a
+  **broadcast-shape matrix** (`crafted_broadcast_matrix_*`): every
+  coding tool our encoder can switch on (plain / SPX / AHT / TPNP /
+  SPX + TPNP + full metadata / AHT + mixing metadata) at 48 / 44.1 /
+  32 kHz on stereo 192 kb/s and 5.1 448 kb/s six-block frames plus the
+  1/2/3-block fractional shapes — 40 cells per rate, ffmpeg within
+  57–93 dB of our decode, zero zero-filled frames. The matrix is drawn
+  where the oracle is meaningful: SPX runs with `spxblnd = 31` because
+  the §E.3.6.4.2 noise component is a decoder-private generator (blend 0
+  → 20–30 dB between decoders with identical band spectra, blend 31 →
+  68–77 dB), the per-channel budget keeps the §7.3.4 dither floor
+  (bap = 0 bins, likewise decoder-private noise) out of the gate, and
+  enhanced coupling / dependent substreams are excluded because the
+  oracle does not render them (ecpl: −512-sample lag at 12 dB; the 7.1
+  indep + dep pair: it drops the indep Ls/Rs and leaves one output
+  channel silent). The matrix's first catch was the §7.7.1 `dynrng`
+  LFE omission below. With the encoder's standard coupling (`cpl`)
+  the matrix adds `cpl` and `cpl+spx` cells, and two sweeps walk the
+  broadcast geometry exhaustively: every `spxbegf` code 0..7 with
+  coupling co-active (derived `cplendf` −2..7, default / widest /
+  single-sub-band regions, stereo 128 kb/s and 5.1 384 kb/s with
+  `compr` + `dynrng`: 59–92 dB per channel vs ffmpeg) and seven
+  transmitted `cplbegf`/`cplendf` regions × four rate/mode/sample-rate
+  shapes. The second catch: zero-bit (bap = 0) coupling-channel
+  mantissas were decoded as true zeros in every coupled channel.
+  §7.3.4 applies dither *after* each channel is extracted from the
+  coupling channel, per channel, gated by that channel's `dithflag` —
+  so coupled high bands at low rates (the broadcast norm) came out
+  as spectral holes, 27–39 dB below the reference decoder's band
+  power on a near-threshold fixture; they now match it within 0.5 dB
+  (`coupled_zero_bit_dither_level_matches_ffmpeg`, AC-3 and E-AC-3).
+  Every PSNR gate in the harness is now **noise-ceiling aware**: the
+  §7.3.4 dither and §E.3.6.4.2 SPX noise sequences are left to the
+  decoder, so the stream is decoded twice by us under different noise
+  seeds (`Eac3DecoderState::reseed_noise`) and the ours-vs-ours PSNR is
+  the agreement any two conformant decoders can reach on it; the fixed
+  floor is lowered only to 4 dB under that ceiling. Measured, the
+  ours-vs-ffmpeg PSNR tracks the ceiling cell for cell (dense-noise
+  192 kb/s: 44.28 vs 44.26 dB; SPX `spxbegf = 0`: 59.97 vs 60.05 dB),
+  i.e. the residual against the reference decoder is decoder-private
+  noise only; with `dither = 0` and no SPX blending every cell sits at
+  ~90.7 dB (s16 rounding). Each gate also checks every 1536-sample
+  segment for localised dropouts (power ≥ reference − 6 dB wherever the
+  reference is above −50 dBFS). The env-gated local-vector gate runs
+  the same checks, so a broadcast capture with SPX noise blending and
+  dither — the norm — is judged against its own noise ceiling instead
+  of an unreachable 50 dB.
+  A third leg feeds the **foreign encoder programme-like material**
+  (`generated_program_matrix_*`): harmonic music over a noise bed,
+  syllable-gated speech-like noise and sparse click / tone-burst
+  transients, every channel with its own pitch and noise generator, as
+  mono / stereo / 5.1 at 32 / 44.1 / 48 kHz from starved to transparent
+  rates (mono 32–128, stereo 48–384, 5.1 128–768 kb/s) plus the
+  encoder's earliest and latest coupling start — 135 streams, 459
+  channels. Every stream decodes with zero zero-filled frames and no
+  segment dropout; 320 channels sit at ≥ 50 dB against the reference
+  decoder (up to 93.0 dB), and the 139 below it are dither-limited:
+  they track their own decoder-private noise ceiling at 0.11 dB mean,
+  0.68 dB rms, 3.2 dB worst (lowest absolute figure 34.7 dB with a
+  34.8 dB ceiling, on a 128 kb/s mono speech cell where most bins are
+  zero-bit). No real broadcast capture is available to the repository
+  (the staged corpus is synthetic and the reporter's stream is not
+  redistributable), so this matrix and the env-gated local-vector gate
+  stand in for one. The matrix's one finding was in the decoder-private
+  noise itself: the §7.3.4 dither generator shifted a 16-bit register
+  one bit per value and returned the whole register, so neighbouring
+  transform coefficients received values correlated at 0.5 and a
+  sparsely-set register produced runs of near-identical full-scale
+  values (measured on a transient cell: eight adjacent zero-bit bins of
+  one block all near −0.7, 4.7 dB above nominal dither power and 8 dB
+  above the reference decoder in that block). The generator is now a
+  full-step 32-bit xorshift with a multiplicative output mix — values
+  uniform in ±0.707, uncorrelated at every lag, steady from block to
+  block (pinned by `dither_values_are_uniform_and_uncorrelated`).
+- **Opt-in JOC object presentation** parses EC-3 Extension Type A
   and EMDF metadata from declared E-AC-3 skip fields, reconstructs up to
   16 object signals with the TS 103 420 sparse/QMF pipeline, applies
-  dynamic OAMD updates, and renders a stereo speaker presentation. The
-  existing decoder factories retain their compatibility downmix, and the
-  opt-in decoder falls back to that path on absent, malformed, or
-  unsupported metadata. This is a standards-derived speaker renderer,
-  not Dolby's proprietary binaural/headphone renderer; encoding JOC is
-  outside its scope.
+  dynamic OAMD updates, and renders the objects to a **caller-selected
+  speaker layout** — see "JOC object rendering" below. This is a
+  standards-derived speaker renderer, not Dolby's proprietary
+  binaural/headphone renderer; encoding JOC is outside its scope.
 - Encoder — independent + dependent substream pairs for 1.0 / 2.0 / 5.1
   / 7.1 layouts, with adaptive / frame-based exponent strategies,
   fractional syncframes (§E.2.3.1.5 — see below) and the §3.7
@@ -300,6 +384,19 @@ downmixed to the container's channel count. What it covers:
   `examples/eac3_rate_curves.rs` prints the full
   standard/AHT/SPX/enhanced-coupling rate ladder;
   `aht_quality_scales_with_rate` gates the curve shape in CI.
+
+  **Standard coupling on the encoder side** (the `cpl`, `cpl_begf`,
+  `cpl_endf` options; Annex E `ecplinu = 0`, §E.2.3.3.14-15 / §7.4):
+  every fbw channel of the independent substream is coupled above
+  `cplbegf` (default 8, bin 133) through one shared coupling channel
+  (§7.4.1 channel average) and per-band `cplco` coordinates refreshed
+  on blocks 0 and 3 (block 3 thrifted to `cplcoe = 0` when its codes
+  repeat), Table E2.12 default banding (`cplbndstrce = 0`). It runs
+  co-active with SPX — `cplendf` is then derived from `spxbegf`
+  (Table E1.4, negative for `spxbegf < 2`) and not transmitted — and
+  is exclusive with AHT / enhanced coupling (6-block frames only).
+  The `dither = 0` option signals `dithflag = 0` on every block, for
+  deterministic decodes in conformance comparisons.
 
   **Enhanced coupling is now on the encoder side too**
   (`eac3::make_encoder_with_ecpl(params, EcplParams)` / the `ecpl`,
@@ -436,6 +533,125 @@ downmixed to the container's channel count. What it covers:
   a TPNP corruption sweep, and the external decoder binary accepts
   the syntax (27.4 dB on impulse-train content).
 
+### JOC object rendering (target speaker layout)
+
+An E-AC-3 stream with joint object coding carries a 5.1 downmix plus
+the side information to rebuild up to 16 audio objects and their
+positions (ETSI TS 103 420). The decoder renders those objects to the
+speaker layout you choose:
+
+| `joc_layout` | [`JocLayout`] | channels, in output order |
+| --- | --- | --- |
+| `stereo` | `Stereo` | L, R |
+| `5.1` | `Surround51` | L, R, C, LFE, Ls, Rs |
+| `5.1.2` | `Surround512` | 5.1 + Tsl, Tsr |
+| `5.1.4` | `Surround514` | 5.1 + Tfl, Tfr, Tbl, Tbr |
+| `7.1` | `Surround71` | L, R, C, LFE, Ls, Rs, Lb, Rb |
+| `7.1.2` | `Surround712` | 7.1 + Tsl, Tsr |
+| `7.1.4` | `Surround714` | 7.1 + Tfl, Tfr, Tbl, Tbr |
+| `9.1.6` | `Surround916` | 7.1 + Lw, Rw + Tfl, Tfr, Tsl, Tsr, Tbl, Tbr |
+
+Select it on either construction path:
+
+```rust
+use oxideav_ac3::decoder::{Eac3DecoderOptions, make_eac3_decoder_with_options};
+use oxideav_ac3::eac3::JocLayout;
+use oxideav_core::{CodecId, CodecParameters};
+
+// Direct API (typed options).
+let params = CodecParameters::audio(CodecId::new("eac3"));
+let options = Eac3DecoderOptions::new().with_joc_layout(JocLayout::Surround714);
+let decoder = make_eac3_decoder_with_options(&params, &options)?;
+
+// Registry path: the same option in the parameter bag.
+let mut params = CodecParameters::audio(CodecId::new("eac3"));
+params.options.insert("joc_layout", "7.1.4");
+let decoder = registry.first_decoder(&params)?;
+```
+
+With a multichannel layout the decoder **always** outputs that layout
+(`Decoder::output_params` reports the channel count and channel layout;
+S16 or F32 as usual): frames with valid 5.X JOC/OAMD metadata are
+rendered from the reconstructed objects, and every other frame — a
+stream without object metadata, a malformed or unsupported
+presentation, plain AC-3 — has its coded channels (dependent-substream
+extensions included) routed to their own speakers, so the output shape
+never changes mid-stream. `joc_layout = stereo` is the historical
+`decoder::make_eac3_decoder_with_joc` behaviour: objects are rendered
+when the caller asks for two channels and the §7.8 downmix is the
+fallback. Stereo, 5.1 and 7.1 are described with the matching
+`oxideav-core` `ChannelLayout`; core has no layout with height or wide
+speakers yet, so the others report `ChannelLayout::DiscreteN(n)` and
+[`JocLayout::speakers`] gives the per-slot speaker
+([`JocSpeaker::channel_position`] where core has the position).
+
+**What comes from the specification and what does not.** TS 103 420
+defines the object properties and the geometry they live in — the
+room-anchored coordinate system (clause 4.2.1), the speaker labels and
+their room positions (clause 4.4, Table B.10), the speaker-to-zone
+assignment (Table A.7), the zone-constraint codes (Tables 20 / 21) and
+the bed-channel assignment (Tables 12 / 13) — and stops at the decoder
+interface: how objects become speaker feeds is left to the renderer.
+The panning law here is therefore **this crate's own design**, a
+layered equal-power balance panner:
+
+- speakers are grouped into the listener-plane layer and the top
+  layer, each layer into rows of equal depth, each row ordered left to
+  right (positions per Table B.10; without a back pair the surround
+  pair takes the back wall, as Table A.7 note 2 counts it as the back
+  zone there);
+- a point object is panned with a sine/cosine law between the layers
+  by its height, between the two rows bracketing its depth, and between
+  the two speakers bracketing its left/right position — the squared
+  gains always sum to one; a layout without a top layer keeps the
+  object in the listener plane;
+- object **size** averages the power of up to 3 × 3 × 3 point sources
+  across the object's extent; **channel lock** sends the object to the
+  single nearest speaker; **zone constraints** (and the elevation flag)
+  remove speakers before panning (a speaker stays when at least one of
+  its zones is included; a constraint that would silence the layout is
+  ignored);
+- **bed objects** (speaker-anchored) play from their own speaker when
+  the layout has it and are panned at that speaker's position
+  otherwise; the LFE is bypassed to the LFE channel;
+- gains follow the OAMD update ramps, evaluated on a 32-sample grid and
+  interpolated linearly in between, delayed with the QMF latency.
+
+The stereo renderer keeps its original law (left/right pan by the X
+coordinate, width spreading toward both speakers) and now also accepts
+bed programs. Not rendered: intermediate-spatial-format objects (the
+standard gives their ring geometry no coordinates — such a program
+takes the channel route), screen-anchored scaling (treated as room
+coordinates; no screen size is known to the decoder), object
+divergence and trim, and the 7.X / 5.X + 2 JOC downmix configurations.
+No JOC bitstream is available to this project, so the renderer is
+validated on synthetic JOC/OAMD metadata (unit tests next to the
+renderer: speaker-exact placement, unit power across the room, ramps
+without discontinuities, bed identity, zone / lock / extent behaviour)
+and the layout contract on encoder-made streams (`tests/joc_layout.rs`).
+
+### Elementary-stream container (`.ac3` / `.eac3` / `.ec3`)
+
+[`container`] registers the raw elementary stream with the runtime's
+`ContainerRegistry` (name `ac3`, extensions `ac3` / `eac3` / `ec3`):
+the probe wants the 0x0B77 syncword plus a valid header at offset 0
+**and** at the frame boundary the first header announces, and the
+demuxer emits one packet per presentation period — an AC-3 syncframe
+(`frmsizecod` / `fscod`, Table 5.18, 1536 samples), or an E-AC-3
+program-0 independent frame (`frmsiz`, `numblkscod` → 1/2/3/6 blocks
+of 256 samples, reduced `fscod2` rates) together with the dependent /
+additional-program frames that follow it, so a 7.1 indep + dep pair is
+one packet. Timestamps count samples; duration and seeking use the
+constant-rate estimate from the first packet's size. Packet counts for
+the playback-corpus cells (AC-3 stereo / 5.1, E-AC-3 5.1) match
+`ffprobe -count_frames` (`tests/elementary_stream.rs`).
+
+The decoder itself accepts a packet carrying **several consecutive
+syncframes** (an MPEG-TS PES payload typically does): it splits the
+packet into presentation periods, drains them through successive
+`receive_frame` calls and advances the timestamps by each period's
+sample count rescaled into the packet's time base.
+
 ### CRC
 
 §7.10.1 CRC-16 (poly 0x8005), shared between the encoder (forward
@@ -472,7 +688,9 @@ runs via the `Fuzz` workflow; corpora seed from the fixture set):
   bytes, incl. the metadata opt-in chains and the fractional-frame
   `convsync` tail.
 - **`decode_frames`** — the registry AC-3 / E-AC-3 packet → PCM path,
-  multiple carved packets on one stateful decoder.
+  multiple carved packets on one stateful decoder, with the
+  `joc_layout` option and the F32 output format picked by the input
+  (a fixed layout must keep its frame shape on every hostile frame).
 - **`eac3_substream_walk`** — a persistent `Eac3DecoderState` over
   syncinfo-split syncframes: substream accumulation + §E.3.8.2
   chanmap channel combination.
@@ -480,8 +698,12 @@ runs via the `Fuzz` workflow; corpora seed from the fixture set):
   (added with the #15 JOC contribution): EC-3 Extension Type A
   signalling, the EMDF container walk with its sparse / dense
   Huffman matrix decode, the standalone OAMD object-element decoder,
-  and the QMF object reconstruction + stereo renderer on every
-  container that parses (corpus seeded with synthetic valid EMDF).
+  and the QMF object reconstruction + object renderer (stereo and a
+  selector-picked multichannel layout) on every container that parses
+  (corpus seeded with synthetic valid EMDF), plus a structure-aware
+  leg that builds OAMD programs from the input (dynamic / bed
+  assignment, per-object position, size, zone, elevation, snap, ramp,
+  optional bit flips) and renders them.
 - **`encode_decode_roundtrip`** — structure-aware differential
   testing: a fuzz-picked contract-valid configuration (layout × rate
   × blocks × SPX/AHT/ecpl/TPNP × metadata) encodes arbitrary PCM and
@@ -508,7 +730,16 @@ minimum-rate-floor gaps (no floor at all; coupling side-info missing
 from it) and a starved frame the optional dba segment lists pushed
 one bit over, and the E-AC-3 target found the budget guard demoting
 an elected second anchor instead of collapsing the frame — all fixed
-and pinned, both targets then ran 300 s clean.
+and pinned, both targets then ran 300 s clean. r486 (bounded 90–150 s
+runs of all six targets over the new decoder option paths):
+`decode_frames`, now picking the `joc_layout` option and output format
+from the input, found a concealed frame returning an empty payload
+under a fixed layout and an out-of-bounds read in the stereo downmix
+of a channel-less concealed frame — both fixed and pinned
+(`tests/joc_layout.rs`, `tests/robustness.rs`), then 559k runs clean;
+`joc_oamd_parse` gained a structure-aware leg that synthesizes OAMD
+programs (dynamic and bed, every object property) and renders them
+through each layout — 3.4M + 30k runs clean.
 
 ## Equal-rate position
 
@@ -561,13 +792,98 @@ fixed at `cplbegf = 8` / paired sub-bands / block-0 refresh), transient
 coding at high rates (AC-3 transients/384 −12 dB — the short-block
 path and per-block offset redistribution stop scaling above 192 kbps),
 noise-like content (pink −1..−4 dB) and the 5.1 surround/centre balance
-(−1.4..−5 dB). AHT now codes stationary content 2-23 dB *below* the
-standard path (its tuner never received the exponent bound) and is a
-follow-up of its own. The reference decoder accepts every stream shape
+(−1.4..−5 dB). AHT codes a steady tone 3.5–19 dB *below* the standard
+path (`eac3_rate_curves`, stereo 440 Hz: 96 kb/s 42.0 vs 45.6 dB,
+192 kb/s 52.6 vs 71.3 dB, 448 kb/s 75.6 vs 88.6 dB). The r486 reading
+of that gap: the AHT SNR-offset search is exact (it already bounds the
+single exponent set by the frame maximum), and the loss is in the
+transform itself. With the §3.4.5 constants as deployed the inverse
+DCT is not orthonormal — independent quantisation noise of variance σ²
+on the six AHT coefficients of a bin comes back as 6σ² on each block's
+coefficient (+7.8 dB) — so AHT only pays where the energy collapses
+into one or two AHT coefficients and the rest quantise to the short
+GAQ codewords. A tone whose MDCT phase advances from block to block
+(440 Hz moves 0.35 cycle per block) spreads over all six and keeps the
+full 7.8 dB penalty at equal mantissa width. The fix is therefore an
+election, not a retune: `chahtinu[ch]` per channel (and AHT-aware
+`hebap` offsets) chosen by exact bit cost at equal noise against the
+standard path — which needs AHT and non-AHT channels to coexist in one
+frame, a structural encoder change recorded as the next step. The reference decoder accepts every stream shape
 this encoder emits at these rates; the sole residual decoder
 disagreement is a block in which the channels' `blksw` flags differ
 (the reference corrupts the unswitched channel's overlap region — the
 joint policy keeps our streams out of that case).
+
+## Performance
+
+`cargo run --release --example throughput [seconds]` encodes, decodes
+and object-renders deterministic synthetic 5.1 programme material
+(harmonic stacks with level motion, a noise bed, sparse transients) and
+prints each stage as a multiple of real time together with an FNV-1a
+hash of its output. Figures below: 20 s of programme, decode stages
+repeated 20 times (`THROUGHPUT_REPEAT=20`), single thread, Apple M5 Max,
+rustc 1.98 — the r486 pass, before → after. **Every stage's output
+hash is unchanged**, and a 372-configuration encode / decode hash
+matrix (AC-3 and E-AC-3, mono … 7.1, 32 / 44.1 / 48 kHz, every encoder
+tool) is byte-identical before and after.
+
+| stage (× real time) | before | after |
+| --- | ---: | ---: |
+| encode AC-3 5.1 448 kb/s | 0.7 | 25.6 |
+| encode E-AC-3 5.1 384 kb/s | 0.6 | 19.7 |
+| encode E-AC-3 5.1 384 kb/s, SPX + coupling | 1.2 | 36.3 |
+| encode E-AC-3 5.1 384 kb/s, AHT | 2.1 | 42.6 |
+| decode AC-3 5.1 448 kb/s | 253 | 469 |
+| decode E-AC-3 5.1 384 kb/s | 228 | 402 |
+| decode E-AC-3 5.1, SPX + coupling | 276 | 493 |
+| decode E-AC-3 5.1, AHT | 284 | 519 |
+| decode E-AC-3 5.1 → stereo downmix | 221 | 365 |
+| decode E-AC-3 5.1 → 7.1.4 channel route | 202 | 308 |
+| JOC render, 15 moving objects + LFE → stereo | 9.6 | 40.3 |
+| JOC render → 5.1 | 9.1 | 43.8 |
+| JOC render → 7.1.4 | 8.1 | 37.5 |
+| JOC render → 9.1.6 | 7.9 | 39.3 |
+
+Where the time went, and what replaced it (all exact — same values,
+same summation order):
+
+- **Forward MDCT** (encoders): the direct-form §8.2.3.2 sum evaluated a
+  `cos` per term — 131 072 per block and channel. The kernels are
+  tabulated once (`[n][k]`, each entry by the same expression) and the
+  loops nested so every coefficient still accumulates over ascending
+  `n` while the inner loop runs over independent sums.
+- **SNR-offset search** (encoders): all 1024 `(csnroffst, fsnroffst)`
+  pairs were tried, each re-running the whole §7.2.2 PSD / excitation /
+  mask pipeline for every channel and block. The mask is now built once
+  per channel-block (`MaskedPsd`); a candidate only redoes the final
+  pointer lookup, counted as a histogram (`AllocEval`), and the largest
+  fitting offset is found by bisecting a monotone lower bound of the
+  bit count (grouped mantissas at their fractional cost) and walking
+  down to the first exact fit — provably the same answer as the
+  exhaustive scan. The per-channel and per-block refinements re-count
+  only the cells whose offset changed.
+- **Exponent cadence election** (encoders): the 32 anchor patterns of a
+  frame only ever contain 21 distinct runs; each run's cost is computed
+  once instead of once per pattern.
+- **IMDCT** (decoders): the pre/post-twiddle tables were rebuilt (256
+  `cos`/`sin`) on every call and the FFT derived its twiddles by a
+  running product inside the butterfly loop; both are tables now (the
+  FFT's holding the same running-product values).
+- **Per-coefficient `2^-exp`** (decoders): `powi` per mantissa became a
+  table of exact powers of two. Debug-trace switches, formerly ~12
+  environment lookups per audio block, are read once per process.
+- **JOC QMF bank and object mix**: analysis / synthesis modulation and
+  the channel-to-object matrix run with the long dimension innermost
+  over independent accumulators (same accumulation order per output);
+  the per-timeslot scratch allocation and a 1280-sample silence scan
+  per object and timeslot are gone; the stereo pan law is evaluated
+  once per ramp position instead of once per sample; the layout panner
+  evaluates each pan stage once per coordinate of the extent grid.
+
+Remaining headroom is structural and would change output bits: the
+forward MDCT and the JOC QMF bank are still direct-form `O(N²)`
+(an FFT-based form rounds differently), and the cadence election still
+runs the allocator on every candidate run.
 
 ## Installation
 

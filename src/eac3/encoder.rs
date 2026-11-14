@@ -37,38 +37,39 @@
 //! bit allocation, mantissa quantisation) is identical to AC-3 and we
 //! reuse the helpers from `super::encoder` directly.
 
-use oxideav_core::bits::BitWriter;
 use oxideav_core::Encoder;
+use oxideav_core::bits::BitWriter;
 use oxideav_core::{
     CodecId, CodecParameters, Error, Frame, Packet, Result, SampleFormat, TimeBase,
 };
 
-use crate::audblk::{remat_band_count_spx, BLOCKS_PER_FRAME, N_COEFFS, SAMPLES_PER_BLOCK};
+use crate::audblk::{BLOCKS_PER_FRAME, N_COEFFS, SAMPLES_PER_BLOCK, remat_band_count_spx};
 // The 6-block frame constant (1536) only survives in the test suites'
 // fixture builders; the library paths are block-count-generic now.
 #[cfg(test)]
 use crate::decoder::SAMPLES_PER_FRAME;
 use crate::encoder::{
+    BitAllocParams, CADENCE_CSNR_INIT, CouplingPlan, DbaPlan, LFE_END_MANT, TransientDetector,
     ac3_crc_update, bound_shared_exponents, build_dba_plan, cadence_reference_ba, compute_bap,
     compute_bap_cpl, decode_input_samples, elect_exponent_cadence, extract_exponent,
-    mantissa_bits_total, overhead_bits_for, overhead_bits_for_ends, pick_strategy_for_block,
-    preprocess_d15, quantise_exponents_to_grpsize, quantise_mantissa, tune_snroffst_with_plan_ends,
-    write_exponents_cpl, write_exponents_grouped, write_mantissa_stream, BitAllocParams,
-    CouplingPlan, DbaPlan, TransientDetector, CADENCE_CSNR_INIT, LFE_END_MANT,
+    mantissa_bits_total, overhead_bits_for, overhead_bits_for_ends, pick_mstrcplco,
+    pick_strategy_for_block, preprocess_d15, quantise_cplco, quantise_exponents_to_grpsize,
+    quantise_mantissa, reconstruct_cplco, tune_snroffst_with_plan_ends, write_exponents_cpl,
+    write_exponents_grouped, write_mantissa_stream,
 };
 use crate::mdct::{mdct_256_pair, mdct_512};
 use crate::tables::WINDOW;
 
 use super::ahtenc::{compute_hebap, dct_ii_6, plan_aht_channel, write_aht_channel};
 use super::dsp::DEFAULT_SPX_BNDSTRC;
-use super::ecpl::{reconstruct_carrier, DEFAULT_ECPL_BNDSTRC};
+use super::ecpl::{DEFAULT_ECPL_BNDSTRC, reconstruct_carrier};
 use super::ecplenc::{
-    band_cross_stats, band_mdct_energies, build_carrier_block, carrier_band_gains,
-    chaos_amp_factor, chaos_code_for, quantise_amp, quantise_angle, region_restrict, BandStats,
-    EcplGeometry, EcplParams,
+    BandStats, EcplGeometry, EcplParams, band_cross_stats, band_mdct_energies, build_carrier_block,
+    carrier_band_gains, chaos_amp_factor, chaos_code_for, quantise_amp, quantise_angle,
+    region_restrict,
 };
 use super::spxenc::{
-    band_coord_targets_span_atten, choose_mstrspxco, quantise_coord, SpxGeometry, SpxParams,
+    SpxGeometry, SpxParams, band_coord_targets_span_atten, choose_mstrspxco, quantise_coord,
 };
 
 /// Codec id string used by the E-AC-3 encoder (registered separately from
@@ -132,7 +133,16 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
         Some(v) => {
             return Err(Error::invalid(format!(
                 "eac3 encoder: option aht={v} (expected 1/true/0/false)"
-            )))
+            )));
+        }
+    }
+    match params.options.get("dither") {
+        None | Some("1") | Some("true") => {}
+        Some("0") | Some("false") => concrete.dither = false,
+        Some(v) => {
+            return Err(Error::invalid(format!(
+                "eac3 encoder: option dither={v} (expected 1/true/0/false)"
+            )));
         }
     }
     match params.options.get("tpnp") {
@@ -141,7 +151,7 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
         Some(v) => {
             return Err(Error::invalid(format!(
                 "eac3 encoder: option tpnp={v} (expected 1/true/0/false)"
-            )))
+            )));
         }
     }
     if let Some(ecpl) = ecpl_params_from_options(params)? {
@@ -160,6 +170,10 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
     }
     if let (Some(ecpl), Some(spx)) = (&concrete.ecpl, &concrete.spx) {
         validate_spx_ecpl(spx, ecpl)?;
+    }
+    if let Some(cpl) = std_cpl_params_from_options(params)? {
+        validate_std_cpl(&concrete, &cpl, params.channels.unwrap_or(0))?;
+        concrete.stdcpl = Some(cpl);
     }
     validate_num_blocks_tools(&concrete)?;
     validate_frame_fit(&mut concrete)?;
@@ -391,9 +405,9 @@ fn validate_num_blocks_tools(enc: &Eac3Encoder) -> Result<()> {
                 .into(),
         ));
     }
-    if enc.spx.is_some() || enc.ecpl.is_some() {
+    if enc.spx.is_some() || enc.ecpl.is_some() || enc.stdcpl.is_some() {
         return Err(Error::Unsupported(
-            "eac3 encoder: spx / ecpl require 6-block syncframes (blocks = 6)".into(),
+            "eac3 encoder: spx / ecpl / cpl require 6-block syncframes (blocks = 6)".into(),
         ));
     }
     Ok(())
@@ -490,7 +504,7 @@ fn ecpl_params_from_options(params: &CodecParameters) -> Result<Option<EcplParam
         Some(v) => {
             return Err(Error::invalid(format!(
                 "eac3 encoder: option ecpl={v} (expected 1/true/0/false)"
-            )))
+            )));
         }
     };
     let parse_u8 = |key: &str| -> Result<Option<u8>> {
@@ -513,7 +527,7 @@ fn ecpl_params_from_options(params: &CodecParameters) -> Result<Option<EcplParam
         Some(v) => {
             return Err(Error::invalid(format!(
                 "eac3 encoder: option ecpl_chaos={v} (expected 1/true/0/false)"
-            )))
+            )));
         }
     };
     let on = match enabled {
@@ -542,6 +556,7 @@ fn ecpl_params_from_options(params: &CodecParameters) -> Result<Option<EcplParam
 /// per-block mixing configuration are emitted as absent
 /// (`mixdef = 0`, `paninfoe = 0`, `frmmixcfginfoe = 0`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Eac3MixMetadata {
     /// `dmixmod` (2 bits, §E.2.3.1.11) — preferred stereo downmix
     /// (0 = not indicated, 1 = LtRt, 2 = LoRo; 3 is reserved).
@@ -567,6 +582,64 @@ pub struct Eac3MixMetadata {
     pub extpgmscl: Option<u8>,
 }
 
+impl Eac3MixMetadata {
+    /// Builder: set [`dmixmod`](Self::dmixmod).
+    #[must_use]
+    pub fn with_dmixmod(mut self, v: u8) -> Self {
+        self.dmixmod = v;
+        self
+    }
+
+    /// Builder: set [`ltrtcmixlev`](Self::ltrtcmixlev).
+    #[must_use]
+    pub fn with_ltrtcmixlev(mut self, v: u8) -> Self {
+        self.ltrtcmixlev = v;
+        self
+    }
+
+    /// Builder: set [`lorocmixlev`](Self::lorocmixlev).
+    #[must_use]
+    pub fn with_lorocmixlev(mut self, v: u8) -> Self {
+        self.lorocmixlev = v;
+        self
+    }
+
+    /// Builder: set [`ltrtsurmixlev`](Self::ltrtsurmixlev).
+    #[must_use]
+    pub fn with_ltrtsurmixlev(mut self, v: u8) -> Self {
+        self.ltrtsurmixlev = v;
+        self
+    }
+
+    /// Builder: set [`lorosurmixlev`](Self::lorosurmixlev).
+    #[must_use]
+    pub fn with_lorosurmixlev(mut self, v: u8) -> Self {
+        self.lorosurmixlev = v;
+        self
+    }
+
+    /// Builder: set [`lfemixlevcod`](Self::lfemixlevcod).
+    #[must_use]
+    pub fn with_lfemixlevcod(mut self, v: Option<u8>) -> Self {
+        self.lfemixlevcod = v;
+        self
+    }
+
+    /// Builder: set [`pgmscl`](Self::pgmscl).
+    #[must_use]
+    pub fn with_pgmscl(mut self, v: Option<u8>) -> Self {
+        self.pgmscl = v;
+        self
+    }
+
+    /// Builder: set [`extpgmscl`](Self::extpgmscl).
+    #[must_use]
+    pub fn with_extpgmscl(mut self, v: Option<u8>) -> Self {
+        self.extpgmscl = v;
+        self
+    }
+}
+
 impl Default for Eac3MixMetadata {
     /// −3 dB centre / −3 dB surround downmix levels on both LtRt and
     /// LoRo targets, downmix preference not indicated, no LFE mix
@@ -590,6 +663,7 @@ impl Default for Eac3MixMetadata {
 /// (`dsurmod` / `dheadphonmod`) and ≥ 6-channel (`dsurexmod`) arms are
 /// emitted only when acmod carries them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Eac3InfoMetadata {
     /// `bsmod` (3 bits, Table 5.7) — bit-stream mode.
     pub bsmod: u8,
@@ -611,8 +685,67 @@ pub struct Eac3InfoMetadata {
     pub sourcefscod: bool,
 }
 
+impl Eac3InfoMetadata {
+    /// Builder: set [`bsmod`](Self::bsmod).
+    #[must_use]
+    pub fn with_bsmod(mut self, v: u8) -> Self {
+        self.bsmod = v;
+        self
+    }
+
+    /// Builder: set [`copyrightb`](Self::copyrightb).
+    #[must_use]
+    pub fn with_copyrightb(mut self, v: bool) -> Self {
+        self.copyrightb = v;
+        self
+    }
+
+    /// Builder: set [`origbs`](Self::origbs).
+    #[must_use]
+    pub fn with_origbs(mut self, v: bool) -> Self {
+        self.origbs = v;
+        self
+    }
+
+    /// Builder: set [`dsurmod`](Self::dsurmod).
+    #[must_use]
+    pub fn with_dsurmod(mut self, v: u8) -> Self {
+        self.dsurmod = v;
+        self
+    }
+
+    /// Builder: set [`dheadphonmod`](Self::dheadphonmod).
+    #[must_use]
+    pub fn with_dheadphonmod(mut self, v: u8) -> Self {
+        self.dheadphonmod = v;
+        self
+    }
+
+    /// Builder: set [`dsurexmod`](Self::dsurexmod).
+    #[must_use]
+    pub fn with_dsurexmod(mut self, v: u8) -> Self {
+        self.dsurexmod = v;
+        self
+    }
+
+    /// Builder: set [`audprod`](Self::audprod).
+    #[must_use]
+    pub fn with_audprod(mut self, v: Option<Eac3AudioProduction>) -> Self {
+        self.audprod = v;
+        self
+    }
+
+    /// Builder: set [`sourcefscod`](Self::sourcefscod).
+    #[must_use]
+    pub fn with_sourcefscod(mut self, v: bool) -> Self {
+        self.sourcefscod = v;
+        self
+    }
+}
+
 /// `audprodie` body for [`Eac3InfoMetadata`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Eac3AudioProduction {
     /// `mixlevel` (5 bits, 0..=31) — peak SPL is `80 + mixlevel`.
     pub mixlevel: u8,
@@ -620,6 +753,38 @@ pub struct Eac3AudioProduction {
     pub roomtyp: u8,
     /// `adconvtyp` (1 bit) — HDCD-type A/D conversion.
     pub adconvtyp: bool,
+}
+
+impl Eac3AudioProduction {
+    /// Build a [`Eac3AudioProduction`] from every field.
+    pub fn new(mixlevel: u8, roomtyp: u8, adconvtyp: bool) -> Self {
+        Self {
+            mixlevel,
+            roomtyp,
+            adconvtyp,
+        }
+    }
+
+    /// Builder: set [`mixlevel`](Self::mixlevel).
+    #[must_use]
+    pub fn with_mixlevel(mut self, v: u8) -> Self {
+        self.mixlevel = v;
+        self
+    }
+
+    /// Builder: set [`roomtyp`](Self::roomtyp).
+    #[must_use]
+    pub fn with_roomtyp(mut self, v: u8) -> Self {
+        self.roomtyp = v;
+        self
+    }
+
+    /// Builder: set [`adconvtyp`](Self::adconvtyp).
+    #[must_use]
+    pub fn with_adconvtyp(mut self, v: bool) -> Self {
+        self.adconvtyp = v;
+        self
+    }
 }
 
 impl Default for Eac3InfoMetadata {
@@ -652,6 +817,7 @@ impl Default for Eac3InfoMetadata {
 /// `dsurexmod`, `mixlevel` + `roomtyp` + `adconvtyp`, `sourcefscod`.
 /// Setting any key of a block emits that block.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Eac3Metadata {
     /// `dialnorm` (5 bits, §5.4.2.8 semantics) — valid 1..=31.
     pub dialnorm: u8,
@@ -664,6 +830,43 @@ pub struct Eac3Metadata {
     pub mixmd: Option<Eac3MixMetadata>,
     /// §E.2.3.1.62+ informational-metadata block (`infomdate = 1`).
     pub infomd: Option<Eac3InfoMetadata>,
+}
+
+impl Eac3Metadata {
+    /// Builder: set [`dialnorm`](Self::dialnorm).
+    #[must_use]
+    pub fn with_dialnorm(mut self, v: u8) -> Self {
+        self.dialnorm = v;
+        self
+    }
+
+    /// Builder: set [`compr`](Self::compr).
+    #[must_use]
+    pub fn with_compr(mut self, v: Option<u8>) -> Self {
+        self.compr = v;
+        self
+    }
+
+    /// Builder: set [`dynrng`](Self::dynrng).
+    #[must_use]
+    pub fn with_dynrng(mut self, v: Option<u8>) -> Self {
+        self.dynrng = v;
+        self
+    }
+
+    /// Builder: set [`mixmd`](Self::mixmd).
+    #[must_use]
+    pub fn with_mixmd(mut self, v: Option<Eac3MixMetadata>) -> Self {
+        self.mixmd = v;
+        self
+    }
+
+    /// Builder: set [`infomd`](Self::infomd).
+    #[must_use]
+    pub fn with_infomd(mut self, v: Option<Eac3InfoMetadata>) -> Self {
+        self.infomd = v;
+        self
+    }
 }
 
 impl Default for Eac3Metadata {
@@ -716,20 +919,20 @@ impl Eac3Metadata {
                     )));
                 }
             }
-            if let Some(l) = m.lfemixlevcod {
-                if l > 31 {
-                    return Err(Error::invalid(format!(
-                        "eac3 encoder: lfemixlevcod {l} out of range (0..=31)"
-                    )));
-                }
+            if let Some(l) = m.lfemixlevcod
+                && l > 31
+            {
+                return Err(Error::invalid(format!(
+                    "eac3 encoder: lfemixlevcod {l} out of range (0..=31)"
+                )));
             }
             for (name, v) in [("pgmscl", m.pgmscl), ("extpgmscl", m.extpgmscl)] {
-                if let Some(v) = v {
-                    if v > 63 {
-                        return Err(Error::invalid(format!(
-                            "eac3 encoder: {name} {v} out of range (0..=63)"
-                        )));
-                    }
+                if let Some(v) = v
+                    && v > 63
+                {
+                    return Err(Error::invalid(format!(
+                        "eac3 encoder: {name} {v} out of range (0..=63)"
+                    )));
                 }
             }
         }
@@ -1075,6 +1278,167 @@ fn spx_params_from_options(params: &CodecParameters) -> Result<Option<SpxParams>
     }))
 }
 
+/// Standard-coupling configuration (Annex E `ecplinu = 0`,
+/// §E.2.3.3.14-15). `None` fields take the defaults chosen by
+/// [`StdCplGeometry::derive`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct StdCplParams {
+    /// `cplbegf` (4 bits). Default 8 (bin 133), lowered to the derived
+    /// end when SPX bounds the region below that.
+    begf: Option<u8>,
+    /// `cplendf` (4 bits) — transmitted only when SPX is off (with SPX
+    /// it is derived from `spxbegf`, so setting it is rejected).
+    /// Default 15 (bin 253).
+    endf: Option<u8>,
+}
+
+/// Resolved standard-coupling region (§E.2.3.3.14-15 / §7.4.2).
+#[derive(Clone, Copy, Debug)]
+struct StdCplGeometry {
+    /// `cplbegf` code.
+    begf: u8,
+    /// Transmitted `cplendf` (SPX off only).
+    endf: u8,
+    /// SPX co-active: `cplendf` is derived and not transmitted.
+    spx_bounded: bool,
+    /// `ncplsubnd = 3 + cplendf - cplbegf`.
+    nsubbnd: usize,
+    /// Merge flags by offset from `cplbegf` (Table E2.12 default
+    /// structure — `cplbndstrce = 0` on the frame's first coupling
+    /// block).
+    bndstrc: [bool; 18],
+    /// Number of coupling bands after merging.
+    nbnd: usize,
+    /// Sub-band offset → band index.
+    sbnd_to_bnd: [usize; 18],
+    /// First coupled bin (`37 + 12·cplbegf`).
+    begin_bin: usize,
+    /// One past the last coupled bin (`37 + 12·(cplendf + 3)`).
+    end_bin: usize,
+}
+
+impl StdCplGeometry {
+    fn derive(p: &StdCplParams, spx: Option<&SpxParams>) -> Result<Self> {
+        // Signed cplendf: with SPX in use, Table E1.4 derives it from
+        // spxbegf and notes it may be negative (spxbegf < 2).
+        let (endf_signed, spx_bounded): (i32, bool) = match spx {
+            Some(sp) => {
+                if p.endf.is_some() {
+                    return Err(Error::invalid(
+                        "eac3 encoder: cpl_endf is derived from spx_begf when SPX is on \
+                         (Table E1.4) and cannot be set",
+                    ));
+                }
+                let b = sp.spxbegf as i32;
+                (if b < 6 { b - 2 } else { b * 2 - 7 }, true)
+            }
+            None => (p.endf.unwrap_or(15) as i32, false),
+        };
+        let max_begf = endf_signed + 2; // ncplsubnd >= 1
+        if max_begf < 0 {
+            return Err(Error::invalid("eac3 encoder: empty coupling region"));
+        }
+        let begf = match p.begf {
+            Some(b) => b as i32,
+            None => 8.min(max_begf),
+        };
+        if !(0..=15).contains(&begf) || !(-2..=15).contains(&endf_signed) {
+            return Err(Error::invalid(format!(
+                "eac3 encoder: coupling codes out of range (cplbegf={begf}, cplendf={endf_signed})"
+            )));
+        }
+        let nsubbnd_signed = 3 + endf_signed - begf;
+        if nsubbnd_signed < 1 {
+            return Err(Error::invalid(format!(
+                "eac3 encoder: cpl_begf={begf} leaves no coupling sub-band below cplendf+2={max_begf}"
+            )));
+        }
+        let nsubbnd = nsubbnd_signed as usize;
+        let mut bndstrc = [false; 18];
+        for (off, slot) in bndstrc.iter_mut().enumerate().take(nsubbnd).skip(1) {
+            *slot = super::dsp::DEFCPLBNDSTRC[begf as usize + off];
+        }
+        let mut sbnd_to_bnd = [0usize; 18];
+        let mut bnd = 0usize;
+        for (off, slot) in sbnd_to_bnd.iter_mut().enumerate().take(nsubbnd) {
+            if off > 0 && !bndstrc[off] {
+                bnd += 1;
+            }
+            *slot = bnd;
+        }
+        Ok(Self {
+            begf: begf as u8,
+            endf: endf_signed.max(0) as u8,
+            spx_bounded,
+            nsubbnd,
+            bndstrc,
+            nbnd: bnd + 1,
+            sbnd_to_bnd,
+            begin_bin: 37 + 12 * begf as usize,
+            end_bin: (37 + 12 * (endf_signed + 3)) as usize,
+        })
+    }
+}
+
+fn std_cpl_params_from_options(params: &CodecParameters) -> Result<Option<StdCplParams>> {
+    let opts = &params.options;
+    let parse_u8 = |key: &str| -> Result<Option<u8>> {
+        match opts.get(key) {
+            None => Ok(None),
+            Some(v) => match v.parse::<u8>() {
+                Ok(n) if n <= 15 => Ok(Some(n)),
+                _ => Err(Error::invalid(format!(
+                    "eac3 encoder: option {key}={v} (expected 0..=15)"
+                ))),
+            },
+        }
+    };
+    let enabled = match opts.get("cpl") {
+        None => None,
+        Some("1") | Some("true") => Some(true),
+        Some("0") | Some("false") => Some(false),
+        Some(v) => {
+            return Err(Error::invalid(format!(
+                "eac3 encoder: option cpl={v} (expected 1/true/0/false)"
+            )));
+        }
+    };
+    let begf = parse_u8("cpl_begf")?;
+    let endf = parse_u8("cpl_endf")?;
+    // `cpl=0` wins over sub-keys; sub-keys alone imply enablement.
+    if !enabled.unwrap_or(begf.is_some() || endf.is_some()) {
+        return Ok(None);
+    }
+    Ok(Some(StdCplParams { begf, endf }))
+}
+
+/// Construction-time checks for standard coupling: two or more fbw
+/// channels, a valid region (with SPX: below the SPX begin), and no
+/// other coupling-domain tool alongside.
+fn validate_std_cpl(enc: &Eac3Encoder, cpl: &StdCplParams, channels: u16) -> Result<()> {
+    if channels < 2 {
+        return Err(Error::Unsupported(
+            "eac3 encoder: cpl needs at least two fbw channels".into(),
+        ));
+    }
+    if enc.aht || enc.ecpl.is_some() {
+        return Err(Error::Unsupported(
+            "eac3 encoder: cpl cannot be combined with aht / ecpl (single-subsystem scope)".into(),
+        ));
+    }
+    if let Some(spx) = &enc.spx
+        && spx.channel_mask.is_some()
+    {
+        return Err(Error::Unsupported(
+            "eac3 encoder: spx channel_mask cannot be combined with cpl — every coupled \
+             channel must also be in SPX"
+                .into(),
+        ));
+    }
+    StdCplGeometry::derive(cpl, enc.spx.as_ref())?;
+    Ok(())
+}
+
 /// Build the concrete [`Eac3Encoder`] (with `snroffststr == 0`). The
 /// public [`make_encoder`] boxes this behind `dyn Encoder`; the test-only
 /// [`make_encoder_with_snroffststr`] reuses it and overrides the strategy.
@@ -1092,7 +1456,7 @@ fn build_concrete_encoder(params: &CodecParameters) -> Result<Eac3Encoder> {
         _ => {
             return Err(Error::Unsupported(format!(
                 "eac3 encoder: unsupported sample rate {sample_rate} (48000/44100/32000 only)"
-            )))
+            )));
         }
     };
     let target_kbps: Option<u32> = params.bit_rate.map(|b| (b / 1000) as u32);
@@ -1186,7 +1550,7 @@ fn build_concrete_encoder(params: &CodecParameters) -> Result<Eac3Encoder> {
         n => {
             return Err(Error::Unsupported(format!(
                 "eac3 encoder: unsupported channel count {n} (must be 1, 2, 6, or 8)"
-            )))
+            )));
         }
     };
 
@@ -1269,6 +1633,8 @@ fn build_concrete_encoder(params: &CodecParameters) -> Result<Eac3Encoder> {
         spx: None,
         aht: false,
         ecpl: None,
+        stdcpl: None,
+        dither: true,
         meta: Eac3Metadata::default(),
         num_blocks,
         frames_emitted: 0,
@@ -1473,6 +1839,20 @@ struct Eac3Encoder {
     /// is on. Mutually exclusive with `spx` and `aht`
     /// (single-subsystem scope).
     ecpl: Option<EcplParams>,
+    /// Standard coupling (§E.2.3.3.14-15 with `ecplinu = 0`, §7.4).
+    /// When `Some` (via the `cpl*` options) every fbw channel of the
+    /// independent substream is coupled above `cplbegf`: one shared
+    /// coupling channel plus per-band `cplco` coordinates refreshed on
+    /// blocks 0 and 3. Co-active with SPX (the coupling region then
+    /// ends at the SPX begin frequency, `cplendf` derived and possibly
+    /// negative — Table E1.4 note); exclusive with `aht` / `ecpl`.
+    stdcpl: Option<StdCplParams>,
+    /// `dithflag[ch]` policy (§5.4.3.2 / §7.3.4). `true` (default):
+    /// dither on except around block switches (§8.2.9). `false` (the
+    /// `dither = 0` option): every block signals `dithflag = 0`, so
+    /// zero-bit mantissas decode as true zeros — a deterministic decode,
+    /// since the §7.3.4 dither sequence is decoder-private.
+    dither: bool,
     /// Encoder-side bitstream metadata (fixed-BSI dialnorm/compr,
     /// per-block dynrng, Table E1.2 mixing / informational blocks).
     /// Validated at construction.
@@ -1536,7 +1916,7 @@ impl Encoder for Eac3Encoder {
             _ => {
                 return Err(Error::invalid(
                     "eac3 encoder: send_frame requires an audio frame",
-                ))
+                ));
             }
         };
         let per_chan = decode_input_samples(audio, self.total_pcm_chans, self.input_sample_format)?;
@@ -1561,7 +1941,7 @@ impl Encoder for Eac3Encoder {
         let missing = self.frame_samples() - self.pending_samples[0].len();
         if missing > 0 {
             for ch in 0..self.total_pcm_chans {
-                self.pending_samples[ch].extend(std::iter::repeat(0.0).take(missing));
+                self.pending_samples[ch].extend(std::iter::repeat_n(0.0, missing));
             }
         }
         self.emit_syncframe()?;
@@ -1650,6 +2030,22 @@ impl Eac3Encoder {
             }),
             _ => None,
         };
+        // Standard coupling (independent substream, >= 2 fbw channels).
+        let stdcpl_geom: Option<StdCplGeometry> = match &self.stdcpl {
+            Some(p) if sub.strmtyp == 0 && nfchans >= 2 => {
+                Some(StdCplGeometry::derive(p, self.spx.as_ref())?)
+            }
+            _ => None,
+        };
+        let stdcpl_on = stdcpl_geom.is_some();
+        // Either coupling flavour puts a coupling channel in the frame
+        // (`cplinu = 1`); `cpl_region` is its coded bin range.
+        let cpl_on = ecpl_on || stdcpl_on;
+        let cpl_region: Option<(usize, usize)> = match (&ecpl_geom, &stdcpl_geom) {
+            (Some(g), _) => Some((g.start_bin, g.end_bin)),
+            (None, Some(g)) => Some((g.begin_bin, g.end_bin)),
+            (None, None) => None,
+        };
 
         // -------- DSP: window + MDCT per substream channel per block --------
         let mut coeffs: Vec<Vec<[f32; N_COEFFS]>> = vec![vec![[0.0; N_COEFFS]; nblks]; total_chans];
@@ -1724,6 +2120,16 @@ impl Eac3Encoder {
                 }
             }
         }
+
+        // ---- Standard coupling (§7.4.1 / §E.2.3.3.14-15) ----
+        //
+        // Build the coupling channel + per-span coordinates and replace
+        // every coupled channel's region bins with the decoder's
+        // reconstruction, so SPX analysis (whose copy region may reach
+        // into the coupled bins) sees what the decoder will translate.
+        let stdcpl_plan: Option<StdCplPlan> = stdcpl_geom
+            .as_ref()
+            .map(|g| plan_std_cpl(g, &mut coeffs, nfchans, nblks));
 
         // ---- Transient pre-noise processing analysis (§3.7.1) ----
         //
@@ -1821,13 +2227,14 @@ impl Eac3Encoder {
                                 .spx
                                 .as_ref()
                                 .and_then(|p| p.channel_mask)
-                                .map_or(true, |m| m & (1 << ch) != 0)
+                                .is_none_or(|m| m & (1 << ch) != 0)
                     )
             })
             .collect();
-        let end_mant: usize = match (&spx_geom, &ecpl_geom) {
+        let end_mant: usize = match (&spx_geom, cpl_region) {
+            (_, Some((start, _))) if stdcpl_on => start,
             (Some(g), _) => g.begin_tc,
-            (None, Some(g)) => g.start_bin,
+            (None, Some((start, _))) => start,
             (None, None) => end_full,
         };
         // Per-channel coded bandwidth: SPX channels stop at the SPX
@@ -1837,8 +2244,8 @@ impl Eac3Encoder {
         // chbwcod-derived end.
         let end_mant_ch: Vec<usize> = (0..nfchans)
             .map(|ch| {
-                if let Some(g) = &ecpl_geom {
-                    g.start_bin
+                if let Some((start, _)) = cpl_region {
+                    start
                 } else if in_spx[ch] {
                     spx_geom.as_ref().map_or(end_full, |g| g.begin_tc)
                 } else {
@@ -1911,7 +2318,7 @@ impl Eac3Encoder {
         );
         let fscod = self.fscod;
         let bpcb = (sub.frame_bytes * 8 / (nfchans.max(1) * nblks)) as u32;
-        let exp_strategies: [u8; BLOCKS_PER_FRAME] = if fixed_plan || self.aht || ecpl_on {
+        let exp_strategies: [u8; BLOCKS_PER_FRAME] = if fixed_plan || self.aht || cpl_on {
             legacy
         } else if sub.lfeon {
             let lfe_bap = |x: &[u8; N_COEFFS]| -> [u8; N_COEFFS] {
@@ -1968,7 +2375,7 @@ impl Eac3Encoder {
                         p[..nblks].copy_from_slice(&legacy[..nblks]);
                         p
                     } else {
-                        let chbw_bits = if !ecpl_on && !in_spx[ch] { 6 } else { 0 };
+                        let chbw_bits = if !cpl_on && !in_spx[ch] { 6 } else { 0 };
                         let end = end_mant_ch[ch];
                         let fbw_bap = |e: &[u8; N_COEFFS]| -> [u8; N_COEFFS] {
                             let mut bap = [0u8; N_COEFFS];
@@ -2003,12 +2410,8 @@ impl Eac3Encoder {
             let plan = {
                 let mut plan = plan;
                 let budget = (sub.frame_bytes * 8) as u32;
-                let probe_cpl = match &ecpl_geom {
-                    Some(g) => {
-                        CouplingPlan::for_ecpl(g.begin_subbnd, g.end_subbnd, nfchans, g.necplbnd)
-                    }
-                    None => CouplingPlan::default(),
-                };
+                let probe_cpl =
+                    coupling_plan_for(ecpl_geom.as_ref(), stdcpl_geom.as_ref(), nfchans);
                 let probe = overhead_bits_for_ends(
                     &exp_strategies[..nblks],
                     Some(&plan),
@@ -2109,7 +2512,14 @@ impl Eac3Encoder {
         let ecpl_carrier_plan: Option<EcplCarrierPlan> = ecpl_geom
             .as_ref()
             .map(|g| build_ecpl_carrier(g, &coeffs, nfchans));
-        if let (Some(g), Some(plan)) = (&ecpl_geom, &ecpl_carrier_plan) {
+        // The coupling channel's MDCT per block — the enhanced-coupling
+        // carrier or the standard-coupling channel average.
+        let cpl_carrier: Option<&[[f32; N_COEFFS]]> = match (&ecpl_carrier_plan, &stdcpl_plan) {
+            (Some(p), _) => Some(&p.carrier),
+            (None, Some(p)) => Some(&p.carrier),
+            (None, None) => None,
+        };
+        if let (Some((start_bin, end_bin)), Some(carrier)) = (cpl_region, cpl_carrier) {
             // Carrier exponents into the cpl pseudo-channel slot: D15 on
             // the anchor blocks (0 and 3, matching `exp_strategies` and
             // the audfrm `cplexpstr[blk]` codes), REUSE elsewhere —
@@ -2117,19 +2527,19 @@ impl Eac3Encoder {
             // matches the encoder's `exps[]` bin-for-bin.
             let cpl_idx = nfchans;
             for blk in 0..nblks {
-                for k in g.start_bin..g.end_bin {
-                    exps[cpl_idx][blk][k] = extract_exponent(plan.carrier[blk][k]);
+                for k in start_bin..end_bin {
+                    exps[cpl_idx][blk][k] = extract_exponent(carrier[blk][k]);
                 }
             }
             bound_shared_exponents(
                 &mut exps[cpl_idx],
                 &exp_strategies[..nblks],
-                g.start_bin,
-                g.end_bin,
+                start_bin,
+                end_bin,
             );
             for blk in 0..nblks {
                 if exp_strategies[blk] == 1 {
-                    preprocess_d15(&mut exps[cpl_idx][blk][g.start_bin..g.end_bin]);
+                    preprocess_d15(&mut exps[cpl_idx][blk][start_bin..end_bin]);
                 }
             }
             let mut last = 0usize;
@@ -2138,8 +2548,8 @@ impl Eac3Encoder {
                     last = blk;
                 } else {
                     let src: [u8; N_COEFFS] = exps[cpl_idx][last];
-                    exps[cpl_idx][blk][g.start_bin..g.end_bin]
-                        .copy_from_slice(&src[g.start_bin..g.end_bin]);
+                    exps[cpl_idx][blk][start_bin..end_bin]
+                        .copy_from_slice(&src[start_bin..end_bin]);
                 }
             }
         }
@@ -2242,10 +2652,7 @@ impl Eac3Encoder {
         };
         // Coupling plan: the enhanced-coupling carrier region for the
         // shared tuner / bap machinery, or the no-coupling default.
-        let cpl = match &ecpl_geom {
-            Some(g) => CouplingPlan::for_ecpl(g.begin_subbnd, g.end_subbnd, nfchans, g.necplbnd),
-            None => CouplingPlan::default(),
-        };
+        let cpl = coupling_plan_for(ecpl_geom.as_ref(), stdcpl_geom.as_ref(), nfchans);
         let dba_plan = if std::env::var("EAC3_DISABLE_DBA").is_ok() {
             crate::encoder::DbaPlan::default()
         } else {
@@ -2396,6 +2803,28 @@ impl Eac3Encoder {
                 (strategy + true_coords + 16).saturating_sub(modelled_strategy + modelled_coords)
             }
         };
+        // Standard-coupling header bits over the shared overhead model
+        // (which prices the strategy on BOTH anchor blocks, one `cplcoe`
+        // bit per coupled channel per block and ONE block-0 coordinate
+        // payload). This encoder emits the strategy once (block 0, the
+        // audfrm `cplstre` reuse covers the rest) but refreshes the
+        // coordinates on block 3 too: reserve the true cost minus the
+        // modelled cost, with a small slop.
+        let stdcpl_reserve_bits: u32 = match &stdcpl_geom {
+            None => 0,
+            Some(g) => {
+                let nch = nfchans as u32;
+                let nb = g.nbnd as u32;
+                let chincpl_bits = if sub.acmod == 0x2 { 0 } else { nch };
+                let phs = u32::from(sub.acmod == 0x2);
+                let strategy = 1 + chincpl_bits + phs + 4 + if g.spx_bounded { 0 } else { 4 } + 1;
+                let payload = 2 + 8 * nb;
+                let true_coords = nch * (2 * payload + (nblks as u32 - 1));
+                let modelled_strategy = 2 * (nch + 8 + phs + g.nsubbnd.saturating_sub(1) as u32);
+                let modelled_coords = nblks as u32 * nch + nch * payload;
+                (strategy + true_coords + 16).saturating_sub(modelled_strategy + modelled_coords)
+            }
+        };
         // Optional metadata words (compr / mixing / informational
         // blocks / per-block dynrng) on top of the fixed layout.
         let meta_reserve_bits: u32 = self
@@ -2414,6 +2843,7 @@ impl Eac3Encoder {
                 + spx_reserve_bits
                 + aht_reserve_bits
                 + ecpl_reserve_bits
+                + stdcpl_reserve_bits
                 + meta_reserve_bits
                 + tpnp_reserve_bits)
                 .div_ceil(8) as usize,
@@ -2494,8 +2924,8 @@ impl Eac3Encoder {
                 );
             }
         }
-        if let Some(g) = &ecpl_geom {
-            // Enhanced-coupling carrier bap — the §7.2.2.4 coupling
+        if let Some((start_bin, end_bin)) = cpl_region {
+            // Coupling-channel (enhanced carrier / standard average) bap — the §7.2.2.4 coupling
             // excitation path with the tuner's coupling fine offset
             // (tied to the fbw fine offset) and the default fast gain,
             // exactly what the decoder derives from `frmfsnroffst` +
@@ -2509,8 +2939,8 @@ impl Eac3Encoder {
             for blk in 0..nblks {
                 compute_bap_cpl(
                     &exps[cpl_idx][blk],
-                    g.start_bin,
-                    g.end_bin,
+                    start_bin,
+                    end_bin,
                     self.fscod,
                     &cpl_ba,
                     &mut baps[cpl_idx][blk],
@@ -2666,7 +3096,7 @@ impl Eac3Encoder {
         // (blkid / frmsizecod) is never emitted by this encoder.
         if sub.strmtyp == 0 && nblks != BLOCKS_PER_FRAME {
             let group = (BLOCKS_PER_FRAME / nblks) as u64;
-            let convsync = u32::from(self.frames_emitted % group == 0);
+            let convsync = u32::from(self.frames_emitted.is_multiple_of(group));
             bw.write_u32(convsync, 1);
         }
         bw.write_u32(0, 1); // addbsie = 0
@@ -2692,7 +3122,7 @@ impl Eac3Encoder {
             // cplinu[0] — 1 when enhanced coupling is on (the coupling
             // strategy then rides block 0's implicit cplstre = 1 and is
             // reused by every later block via cplstre[blk] = 0).
-            bw.write_u32(u32::from(ecpl_on), 1);
+            bw.write_u32(u32::from(cpl_on), 1);
             for _blk in 1..nblks {
                 bw.write_u32(0, 1); // cplstre[blk] = 0 (strategy reuse)
             }
@@ -2722,7 +3152,7 @@ impl Eac3Encoder {
             // per-channel codes on every block where cplinu[blk] == 1.
             // The carrier follows the frame-wide anchor cadence
             // (D15 on blocks 0/3, REUSE elsewhere).
-            if ecpl_on {
+            if cpl_on {
                 bw.write_u32(exp_strategies[blk] as u32, 2);
             }
             for ch in 0..nfchans {
@@ -2820,7 +3250,7 @@ impl Eac3Encoder {
                 // zeros, so signal dithflag=0 to keep spec-strict
                 // decoders from substituting dither there. Otherwise
                 // dither is on except around block switches (§8.2.9).
-                bw.write_u32(u32::from(!self.aht && dithflag[ch][blk]), 1); // dithflag
+                bw.write_u32(u32::from(self.dither && !self.aht && dithflag[ch][blk]), 1); // dithflag
             }
             // §5.4.3.3-4 dynrnge + dynrng: when metadata configures a
             // dynamic-range word it is transmitted in EVERY block.
@@ -2840,9 +3270,9 @@ impl Eac3Encoder {
                 (Some(g), 0) => {
                     let p = self.spx.as_ref().expect("spx params when geom is set");
                     bw.write_u32(1, 1); // spxinu = 1
-                                        // §E.2.3.3.3 chinspx[ch] — implicit for mono
-                                        // (acmod == 0x1); explicit per fbw channel
-                                        // otherwise (mixed membership allowed).
+                    // §E.2.3.3.3 chinspx[ch] — implicit for mono
+                    // (acmod == 0x1); explicit per fbw channel
+                    // otherwise (mixed membership allowed).
                     if sub.acmod != 0x1 {
                         for &member in in_spx.iter().take(nfchans) {
                             bw.write_u32(u32::from(member), 1);
@@ -2925,6 +3355,54 @@ impl Eac3Encoder {
                 bw.write_u32(0, 1); // ecplbndstrce = 0 → default banding
             }
 
+            // Standard-coupling strategy (§E.2.3.3.14-15, Table E1.4
+            // `ecplinu == 0` arm) on block 0 only — later blocks carry
+            // audfrm `cplstre = 0` (reuse). `cplbndstrce = 0` selects the
+            // Table E2.12 default banding on this first coupling block.
+            if let (Some(g), 0) = (&stdcpl_geom, blk) {
+                bw.write_u32(0, 1); // ecplinu = 0
+                if sub.acmod != 0x2 {
+                    for _ch in 0..nfchans {
+                        bw.write_u32(1, 1); // chincpl[ch] = 1
+                    }
+                } else {
+                    bw.write_u32(0, 1); // phsflginu = 0
+                }
+                bw.write_u32(g.begf as u32, 4); // cplbegf
+                if !g.spx_bounded {
+                    bw.write_u32(g.endf as u32, 4); // cplendf
+                }
+                bw.write_u32(0, 1); // cplbndstrce = 0
+            }
+            // Standard-coupling coordinates (Table E1.4): `cplcoe[ch]`
+            // implicit 1 on block 0 (firstcplcos), explicit after —
+            // refreshed on block 3 unless its codes equal block 0's.
+            if let (Some(g), Some(plan)) = (&stdcpl_geom, &stdcpl_plan) {
+                for ch in 0..nfchans {
+                    let span = usize::from(blk >= 3);
+                    let send = match blk {
+                        0 => true,
+                        3 => {
+                            plan.mstr[ch][1] != plan.mstr[ch][0]
+                                || plan.codes[ch][1] != plan.codes[ch][0]
+                        }
+                        _ => false,
+                    };
+                    if blk != 0 {
+                        bw.write_u32(u32::from(send), 1); // cplcoe[ch]
+                    }
+                    if send {
+                        bw.write_u32(plan.mstr[ch][span] as u32, 2); // mstrcplco
+                        for bnd in 0..g.nbnd {
+                            let (e, m) = plan.codes[ch][span][bnd];
+                            bw.write_u32(e as u32, 4); // cplcoexp
+                            bw.write_u32(m as u32, 4); // cplcomant
+                        }
+                    }
+                }
+                // phsflginu = 0 → no phsflg.
+            }
+
             // Enhanced-coupling coordinates (§E.2.3.3.20-26) — present
             // on every block where cplinu[blk] == 1. Coordinates
             // refresh on the exponent anchor blocks: block 0 has
@@ -2974,8 +3452,8 @@ impl Eac3Encoder {
             // keeps rematrixing disabled (all flags 0).
             if sub.acmod == 2 {
                 let nrematbd = remat_band_count_spx(
-                    ecpl_on,
-                    0,
+                    cpl_on,
+                    stdcpl_geom.as_ref().map_or(0, |g| g.begf),
                     ecpl_on,
                     ecpl_geom.as_ref().map_or(0, |g| g.ecplbegf),
                     spx_geom.is_some(),
@@ -3005,7 +3483,7 @@ impl Eac3Encoder {
             // frequency instead (§E.3.3.3); with mixed chinspx the
             // full-bandwidth channels still carry their chbwcod.
             for ch in 0..nfchans {
-                if !ecpl_on && !in_spx[ch] && chexpstr_plan[ch][blk] != 0 {
+                if !cpl_on && !in_spx[ch] && chexpstr_plan[ch][blk] != 0 {
                     bw.write_u32(chbwcod as u32, 6);
                 }
             }
@@ -3013,10 +3491,10 @@ impl Eac3Encoder {
             // + D15 groups over [ecplstartmant, ecplendmant), emitted on
             // the blocks whose audfrm `cplexpstr[blk]` is non-REUSE
             // (anchors 0 and 3). No gainrng for the coupling channel.
-            if let Some(g) = &ecpl_geom {
-                if exp_strategies[blk] == 1 {
-                    write_exponents_cpl(&mut bw, &exps[nfchans][blk], g.start_bin, g.end_bin);
-                }
+            if let Some((start_bin, end_bin)) = cpl_region
+                && exp_strategies[blk] == 1
+            {
+                write_exponents_cpl(&mut bw, &exps[nfchans][blk], start_bin, end_bin);
             }
             // §E.1.2.4 fbw exponents. After each channel's grouped
             // exponents, the spec emits `gainrng[ch]` (2 bits) — same as
@@ -3093,7 +3571,7 @@ impl Eac3Encoder {
             // (no gate bit): emit cplfleak = cplsleak = 0 directly,
             // matching the 768 + 0 leak init `compute_bap_cpl` assumes.
             // Later blocks emit an explicit `cplleake = 0` (reuse).
-            if ecpl_on {
+            if cpl_on {
                 if blk == 0 {
                     bw.write_u32(0, 3); // cplfleak = 0
                     bw.write_u32(0, 3); // cplsleak = 0
@@ -3105,7 +3583,7 @@ impl Eac3Encoder {
             let any_fbw_dba = (0..nfchans).any(|c| dba_plan.nseg[c] > 0);
             if blk == 0 && any_fbw_dba {
                 bw.write_u32(1, 1); // deltbaie = 1
-                if ecpl_on {
+                if cpl_on {
                     // cpldeltbae precedes the per-channel codes when
                     // cplinu[blk] == 1; 2 = "perform no delta bit
                     // allocation" for the coupling channel.
@@ -3216,14 +3694,16 @@ impl Eac3Encoder {
                     // the remaining channels and the LFE. The grouped
                     // bap-1/2/4 buffers are shared across the whole
                     // walk, which the single `codes` stream preserves.
-                    if let (Some(g), Some(plan), 0) = (&ecpl_geom, &ecpl_carrier_plan, ch) {
-                        for bin in g.start_bin..g.end_bin {
+                    if let (Some((start_bin, end_bin)), Some(carrier), 0) =
+                        (cpl_region, cpl_carrier, ch)
+                    {
+                        for bin in start_bin..end_bin {
                             let bap = baps[nfchans][blk][bin];
                             if bap == 0 {
                                 continue;
                             }
                             let e = exps[nfchans][blk][bin] as i32;
-                            let mant = quantise_mantissa(plan.carrier[blk][bin], e, bap);
+                            let mant = quantise_mantissa(carrier[blk][bin], e, bap);
                             codes.push((bap, mant));
                         }
                     }
@@ -3302,6 +3782,115 @@ impl Eac3Encoder {
             "E-AC-3 crc2 emit produced a non-zero post-syncword residue"
         );
         Ok(frame)
+    }
+}
+
+/// The coupling-plan view of the frame's coupling region for the
+/// shared tuner / bit-accounting machinery.
+fn coupling_plan_for(
+    ecpl: Option<&EcplGeometry>,
+    stdcpl: Option<&StdCplGeometry>,
+    nfchans: usize,
+) -> CouplingPlan {
+    match (ecpl, stdcpl) {
+        (Some(g), _) => CouplingPlan::for_ecpl(g.begin_subbnd, g.end_subbnd, nfchans, g.necplbnd),
+        (None, Some(g)) => CouplingPlan::for_eac3_standard(g.begf, g.nsubbnd, &g.bndstrc, nfchans),
+        (None, None) => CouplingPlan::default(),
+    }
+}
+
+/// Standard-coupling encode plan: the coupling channel and the
+/// quantised per-span coordinates (span 0 = blocks 0..3, span 1 =
+/// blocks 3..6).
+struct StdCplPlan {
+    /// Coupling-channel MDCT per block (§7.4.1 channel average over
+    /// the coupled region; zero elsewhere).
+    carrier: Vec<[f32; N_COEFFS]>,
+    /// `mstrcplco[ch][span]`.
+    mstr: Vec<[u8; 2]>,
+    /// `(cplcoexp, cplcomant)` per `[ch][span][bnd]`.
+    codes: Vec<[[(u8, u8); 18]; 2]>,
+}
+
+/// Standard coupling, encode direction (§7.4.1 / §7.4.3): the coupling
+/// channel is the average of the coupled channels' coefficients; each
+/// channel's per-band coordinate is `sqrt(E_ch / E_cpl) / 8` over the
+/// span (the decoder reconstructs `cplmant · cplco · 8`). Every coupled
+/// channel's region bins are then replaced by that reconstruction.
+fn plan_std_cpl(
+    g: &StdCplGeometry,
+    coeffs: &mut [Vec<[f32; N_COEFFS]>],
+    nfchans: usize,
+    nblks: usize,
+) -> StdCplPlan {
+    let inv_n = 1.0f32 / nfchans as f32;
+    let mut carrier = vec![[0.0f32; N_COEFFS]; nblks];
+    for (blk, cb) in carrier.iter_mut().enumerate() {
+        for bin in g.begin_bin..g.end_bin {
+            let sum: f32 = (0..nfchans).map(|ch| coeffs[ch][blk][bin]).sum();
+            cb[bin] = sum * inv_n;
+        }
+    }
+    let spans: [(usize, usize); 2] = [(0, 3.min(nblks)), (3.min(nblks), nblks)];
+    let mut mstr = vec![[0u8; 2]; nfchans];
+    let mut codes = vec![[[(15u8, 0u8); 18]; 2]; nfchans];
+    let mut recon = vec![[[0.0f32; 18]; 2]; nfchans];
+    for (span, &(b0, b1)) in spans.iter().enumerate() {
+        let mut e_cpl = [0.0f64; 18];
+        let mut e_ch = vec![[0.0f64; 18]; nfchans];
+        for blk in b0..b1 {
+            for bin in g.begin_bin..g.end_bin {
+                let bnd = g.sbnd_to_bnd[(bin - g.begin_bin) / 12];
+                let c = carrier[blk][bin] as f64;
+                e_cpl[bnd] += c * c;
+                for ch in 0..nfchans {
+                    let v = coeffs[ch][blk][bin] as f64;
+                    e_ch[ch][bnd] += v * v;
+                }
+            }
+        }
+        for ch in 0..nfchans {
+            let mut raw = [0.0f32; 18];
+            let mut max_co = 0.0f32;
+            for bnd in 0..g.nbnd {
+                raw[bnd] = if e_cpl[bnd] > 1e-20 {
+                    ((e_ch[ch][bnd] / e_cpl[bnd]).sqrt() as f32) / 8.0
+                } else {
+                    0.0
+                };
+                max_co = max_co.max(raw[bnd]);
+            }
+            let m = if span == 1 && b0 == b1 {
+                mstr[ch][0]
+            } else {
+                pick_mstrcplco(max_co)
+            };
+            mstr[ch][span] = m;
+            for bnd in 0..g.nbnd {
+                codes[ch][span][bnd] = if span == 1 && b0 == b1 {
+                    codes[ch][0][bnd]
+                } else {
+                    quantise_cplco(raw[bnd], m)
+                };
+                let (e, mm) = codes[ch][span][bnd];
+                recon[ch][span][bnd] = reconstruct_cplco(e, mm, m);
+            }
+        }
+    }
+    for (span, &(b0, b1)) in spans.iter().enumerate() {
+        for blk in b0..b1 {
+            for bin in g.begin_bin..g.end_bin {
+                let bnd = g.sbnd_to_bnd[(bin - g.begin_bin) / 12];
+                for ch in 0..nfchans {
+                    coeffs[ch][blk][bin] = carrier[blk][bin] * recon[ch][span][bnd] * 8.0;
+                }
+            }
+        }
+    }
+    StdCplPlan {
+        carrier,
+        mstr,
+        codes,
     }
 }
 
@@ -3835,7 +4424,7 @@ mod tests {
     /// construction-accepted configuration must encode arbitrary PCM.
     #[test]
     fn seven_one_pair_three_block_128k_never_overflows() {
-        use crate::eac3::decoder::{decode_eac3_packet, Eac3DecoderState};
+        use crate::eac3::decoder::{Eac3DecoderState, decode_eac3_packet};
         use oxideav_core::{AudioFrame, Error, Frame};
         let channels = 8u16;
         let blocks = 3usize;
@@ -4295,14 +4884,14 @@ mod tests {
     }
 
     pub(crate) fn decode_all(bytes: &[u8], frame_bytes: usize) -> Vec<i16> {
-        use crate::eac3::decoder::{decode_eac3_packet, Eac3DecoderState};
+        use crate::eac3::decoder::{Eac3DecoderState, decode_eac3_packet};
         let mut st = Eac3DecoderState::default();
         let mut out = Vec::new();
         let mut off = 0usize;
         while off + frame_bytes <= bytes.len() {
             let frame = decode_eac3_packet(&mut st, &bytes[off..off + frame_bytes])
                 .expect("decode eac3 packet");
-            for chunk in frame.pcm_s16le.chunks_exact(2) {
+            for chunk in frame.pcm_s16le.as_chunks::<2>().0 {
                 out.push(i16::from_le_bytes([chunk[0], chunk[1]]));
             }
             off += frame_bytes;
@@ -4964,24 +5553,28 @@ mod tests {
         let mut p = CodecParameters::audio(CodecId::new(CODEC_ID_STR));
         p.sample_rate = Some(48_000);
         p.channels = Some(2);
-        assert!(make_encoder_with_spx(
-            &p,
-            SpxParams {
-                channel_mask: Some(0),
-                ..SpxParams::default()
-            }
-        )
-        .is_err());
+        assert!(
+            make_encoder_with_spx(
+                &p,
+                SpxParams {
+                    channel_mask: Some(0),
+                    ..SpxParams::default()
+                }
+            )
+            .is_err()
+        );
         // Mono cannot exclude its only channel (chinspx[0] implicit).
         p.channels = Some(1);
-        assert!(make_encoder_with_spx(
-            &p,
-            SpxParams {
-                channel_mask: Some(0b10),
-                ..SpxParams::default()
-            }
-        )
-        .is_err());
+        assert!(
+            make_encoder_with_spx(
+                &p,
+                SpxParams {
+                    channel_mask: Some(0b10),
+                    ..SpxParams::default()
+                }
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -5067,6 +5660,168 @@ mod tests {
         // Plain enable works.
         params.options = oxideav_core::CodecOptions::new().set("spx", "1");
         assert!(make_encoder(&params).is_ok());
+    }
+
+    fn cpl_params(channels: u16, bit_rate: u64, opts: &[(&str, &str)]) -> CodecParameters {
+        let mut params = CodecParameters::audio(CodecId::new(CODEC_ID_STR));
+        params.sample_rate = Some(48_000);
+        params.channels = Some(channels);
+        params.bit_rate = Some(bit_rate);
+        let mut o = oxideav_core::CodecOptions::new();
+        for (k, v) in opts {
+            o = o.set(*k, *v);
+        }
+        params.options = o;
+        params
+    }
+
+    #[test]
+    fn std_cpl_options_validation_and_gating() {
+        let ok = |opts: &[(&str, &str)]| make_encoder(&cpl_params(2, 192_000, opts)).is_ok();
+        assert!(ok(&[("cpl", "1")]));
+        assert!(ok(&[("cpl_begf", "3")])); // sub-key implies enable
+        assert!(ok(&[("cpl", "0"), ("cpl_begf", "15"), ("cpl_endf", "0")])); // cpl=0 wins
+        assert!(!ok(&[("cpl", "maybe")]));
+        assert!(!ok(&[("cpl_begf", "16")]));
+        // ncplsubnd = 3 + cplendf - cplbegf must be >= 1.
+        assert!(ok(&[("cpl_begf", "12"), ("cpl_endf", "10")]));
+        assert!(!ok(&[("cpl_begf", "13"), ("cpl_endf", "10")]));
+        // With SPX, cplendf is derived (Table E1.4) — setting it is an
+        // error, and the region must stay below the SPX begin.
+        assert!(!ok(&[("cpl", "1"), ("spx", "1"), ("cpl_endf", "7")]));
+        assert!(ok(&[
+            ("cpl", "1"),
+            ("spx", "1"),
+            ("spx_begf", "0"),
+            ("cpl_begf", "0")
+        ]));
+        assert!(!ok(&[
+            ("cpl", "1"),
+            ("spx", "1"),
+            ("spx_begf", "0"),
+            ("cpl_begf", "1")
+        ]));
+        assert!(!ok(&[("cpl", "1"), ("spx", "1"), ("spx_chmask", "1")]));
+        // Single-subsystem scope and 6-block scope.
+        assert!(!ok(&[("cpl", "1"), ("aht", "1")]));
+        assert!(!ok(&[("cpl", "1"), ("ecpl", "1")]));
+        assert!(!ok(&[("cpl", "1"), ("blocks", "3")]));
+        assert!(make_encoder(&cpl_params(1, 96_000, &[("cpl", "1")])).is_err());
+        // dither knob.
+        assert!(ok(&[("dither", "0")]));
+        assert!(!ok(&[("dither", "maybe")]));
+    }
+
+    #[test]
+    fn std_cpl_geometry_negative_cplendf_meets_spx_begin() {
+        // Table E1.4: with SPX in use cplendf = spxbegf - 2 (spxbegf <
+        // 6) or 2·spxbegf - 7 — negative for spxbegf 0/1 — and the
+        // coupling region ends exactly where SPX begins.
+        for spxbegf in 0..=7u8 {
+            let spx = SpxParams {
+                spxbegf,
+                ..SpxParams::default()
+            };
+            let g = StdCplGeometry::derive(&StdCplParams::default(), Some(&spx)).unwrap();
+            let spx_g = SpxGeometry::derive(&spx, &DEFAULT_SPX_BNDSTRC).unwrap();
+            assert_eq!(g.end_bin, spx_g.begin_tc, "spxbegf={spxbegf}");
+            assert!(g.spx_bounded);
+            let endf_signed = if spxbegf < 6 {
+                spxbegf as i32 - 2
+            } else {
+                2 * spxbegf as i32 - 7
+            };
+            assert_eq!(g.nsubbnd as i32, 3 + endf_signed - g.begf as i32);
+        }
+        let spx0 = SpxParams {
+            spxbegf: 0,
+            ..SpxParams::default()
+        };
+        let g = StdCplGeometry::derive(&StdCplParams::default(), Some(&spx0)).unwrap();
+        assert_eq!((g.begf, g.nsubbnd, g.begin_bin, g.end_bin), (0, 1, 37, 49));
+        // Default region (cplbegf 8, cplendf 15): the merge flags are
+        // the Table E2.12 entries for absolute sub-bands 9..17.
+        let g = StdCplGeometry::derive(&StdCplParams::default(), None).unwrap();
+        assert_eq!((g.begf, g.nsubbnd), (8, 10));
+        let merged: Vec<bool> = (1..g.nsubbnd).map(|o| g.bndstrc[o]).collect();
+        let table: Vec<bool> = (9..18)
+            .map(|s| super::super::dsp::DEFCPLBNDSTRC[s])
+            .collect();
+        assert_eq!(merged, table);
+    }
+
+    fn assert_std_cpl_roundtrip(opts: &[(&str, &str)], bit_rate: u64, frame_bytes: usize) {
+        let channels = 2usize;
+        let params = cpl_params(channels as u16, bit_rate, opts);
+        let spx = spx_params_from_options(&params).unwrap();
+        let cpl = std_cpl_params_from_options(&params).unwrap().unwrap();
+        let g = StdCplGeometry::derive(&cpl, spx.as_ref()).unwrap();
+        let mut enc = make_encoder(&params).expect("make_encoder cpl");
+        let pcm = build_spx_multitone(channels, 8);
+        let s16: Vec<u8> = pcm
+            .iter()
+            .flat_map(|&v| ((v * 32767.0).clamp(-32768.0, 32767.0) as i16).to_le_bytes())
+            .collect();
+        enc.send_frame(&Frame::Audio(oxideav_core::AudioFrame {
+            samples: (pcm.len() / channels) as u32,
+            pts: Some(0),
+            data: vec![s16],
+        }))
+        .unwrap();
+        enc.flush().unwrap();
+        let mut stream = Vec::new();
+        loop {
+            match enc.receive_packet() {
+                Ok(p) => stream.extend_from_slice(&p.data),
+                Err(Error::NeedMore) | Err(Error::Eof) => break,
+                Err(e) => panic!("eac3 cpl encode error: {e:?}"),
+            }
+        }
+        assert_eq!(stream.len() % frame_bytes, 0);
+        let dec = to_f32_interleaved(&decode_all(&stream, frame_bytes));
+        for ch in 0..channels {
+            let orig = mdct_energy_profile(&pcm, channels, ch);
+            let got = mdct_energy_profile(&dec, channels, ch);
+            // Per coupling band: the coordinates carry each channel's
+            // band energy (§7.4.3).
+            for bnd in 0..g.nbnd {
+                let bins: Vec<usize> = (g.begin_bin..g.end_bin)
+                    .filter(|&b| g.sbnd_to_bnd[(b - g.begin_bin) / 12] == bnd)
+                    .collect();
+                let eo: f64 = bins.iter().map(|&b| orig[b]).sum();
+                let ed: f64 = bins.iter().map(|&b| got[b]).sum();
+                let d = 10.0 * (ed.max(1e-30) / eo.max(1e-30)).log10();
+                assert!(d.abs() <= 2.0, "{opts:?} ch{ch} cpl band {bnd}: {d:+.2} dB");
+            }
+            let eo: f64 = orig[..g.begin_bin].iter().sum();
+            let ed: f64 = got[..g.begin_bin].iter().sum();
+            let d = 10.0 * (ed / eo).log10();
+            assert!(
+                d.abs() <= 1.5,
+                "{opts:?} ch{ch}: coded-band delta {d:+.2} dB"
+            );
+        }
+    }
+
+    #[test]
+    fn std_cpl_roundtrip_band_energy() {
+        assert_std_cpl_roundtrip(&[("cpl", "1"), ("cpl_begf", "5")], 192_000, 768);
+        assert_std_cpl_roundtrip(&[("cpl", "1")], 128_000, 512);
+    }
+
+    #[test]
+    fn std_cpl_with_spx_roundtrip_band_energy() {
+        // Coupling between cplbegf and the SPX begin (derived cplendf).
+        assert_std_cpl_roundtrip(
+            &[
+                ("cpl", "1"),
+                ("cpl_begf", "2"),
+                ("spx", "1"),
+                ("spx_begf", "4"),
+            ],
+            128_000,
+            512,
+        );
     }
 
     #[test]
@@ -5574,9 +6329,9 @@ mod ecpl_tests {
             for (bnd, d) in deltas.iter().enumerate() {
                 if band_energies[bnd] < peak * 1e-3 {
                     continue; // > 30 dB below the loudest band: the
-                              // pure-tone fixtures leave only MDCT
-                              // leakage there — reconstruction noise
-                              // vs leakage is not a meaningful ratio.
+                    // pure-tone fixtures leave only MDCT
+                    // leakage there — reconstruction noise
+                    // vs leakage is not a meaningful ratio.
                 }
                 assert!(
                     d.abs() <= band_tol_db,
@@ -5756,7 +6511,7 @@ mod ecpl_tests {
         let pair_bytes = 1536 + 768;
         assert_eq!(stream.len() % pair_bytes, 0, "not a whole pair stream");
 
-        use crate::eac3::decoder::{decode_eac3_packet, Eac3DecoderState};
+        use crate::eac3::decoder::{Eac3DecoderState, decode_eac3_packet};
         let mut st = Eac3DecoderState::default();
         let mut out: Vec<i16> = Vec::new();
         let mut channels = 0usize;
@@ -5766,7 +6521,7 @@ mod ecpl_tests {
                 .expect("decode ecpl 7.1 indep+dep packet");
             assert_eq!(frame.channels, 8, "expected 8 output channels");
             channels = frame.channels as usize;
-            for c in frame.pcm_s16le.chunks_exact(2) {
+            for c in frame.pcm_s16le.as_chunks::<2>().0 {
                 out.push(i16::from_le_bytes([c[0], c[1]]));
             }
             off += pair_bytes;
@@ -6653,7 +7408,9 @@ mod meta_tests {
         let _ = std::fs::remove_file(&out_path);
         Some(
             bytes
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|c| i16::from_le_bytes([c[0], c[1]]))
                 .collect(),
         )

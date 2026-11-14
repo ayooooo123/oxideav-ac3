@@ -52,6 +52,41 @@ pub struct JocMetadata {
     pub(super) object_updates: Vec<JocObjectUpdate>,
 }
 
+impl JocMetadata {
+    /// Synthetic 5.X metadata: object `n` is reconstructed from JOC
+    /// channel `routing[n] % 5` alone (order L, R, C, Ls, Rs) with unit
+    /// gain in every parameter band, and `oamd_payload` carries the
+    /// object properties. For tests, benches and fuzz harnesses.
+    #[doc(hidden)]
+    pub fn synthetic(sequence_count: u16, oamd_payload: Vec<u8>, routing: &[usize]) -> Self {
+        Self {
+            complexity_index: 1,
+            group_id: 0,
+            oamd_payload,
+            joc_payload: Vec::new(),
+            downmix_config: 0,
+            num_objects: routing.len().min(255) as u8,
+            extension_config: 0,
+            sequence_count,
+            num_channels: 5,
+            clip_gain: 1.0,
+            object_updates: routing
+                .iter()
+                .map(|&channel| {
+                    let mut coefficients = vec![0.0; 5];
+                    coefficients[channel % 5] = 1.0;
+                    JocObjectUpdate::Parameters {
+                        num_bands: 1,
+                        slope: false,
+                        offsets: Vec::new(),
+                        coefficients,
+                    }
+                })
+                .collect(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum JocObjectUpdate {
     /// No side information was sent for this object; retain the previous frame's
@@ -199,7 +234,7 @@ pub fn parse_joc_emdf(container: &[u8], signal: JocSignal) -> Result<JocMetadata
         if payload_size > declared_body_len
             || payload_size
                 .checked_mul(8)
-                .map_or(true, |payload_bits| payload_bits > bits.remaining())
+                .is_none_or(|payload_bits| payload_bits > bits.remaining())
         {
             return Err(JocParseError::Truncated("EMDF payload"));
         }
@@ -619,11 +654,7 @@ fn decode_huffman(bits: &mut BitCursor<'_>, table: &[[i16; 2]]) -> Result<u16, J
 }
 
 fn quantizer_steps(quant_index: u8) -> u16 {
-    if quant_index == 0 {
-        96
-    } else {
-        192
-    }
+    if quant_index == 0 { 96 } else { 192 }
 }
 
 fn dequantize(value: u16, nquant: u16, quant_index: u8) -> f32 {
@@ -937,11 +968,13 @@ mod tests {
         }
 
         fn into_bytes(mut self) -> Vec<u8> {
-            while self.bits.len() % 8 != 0 {
+            while !self.bits.len().is_multiple_of(8) {
                 self.bits.push(false);
             }
             self.bits
-                .chunks_exact(8)
+                .as_chunks::<8>()
+                .0
+                .iter()
                 .map(|bits| {
                     bits.iter()
                         .fold(0_u8, |byte, bit| (byte << 1) | u8::from(*bit))

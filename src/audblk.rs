@@ -31,8 +31,8 @@ use oxideav_core::{Error, Result};
 use crate::bsi::Bsi;
 use crate::syncinfo::SyncInfo;
 use crate::tables::{
-    BAPTAB, BNDSZ, BNDTAB, DBPBTAB, FASTDEC, FASTGAIN, FLOORTAB, HTH, LATAB, MANT_LEVEL_11,
-    MANT_LEVEL_15, MANT_LEVEL_3, MANT_LEVEL_5, MANT_LEVEL_7, MASKTAB, QUANTIZATION_BITS, SLOWDEC,
+    BAPTAB, BNDSZ, BNDTAB, DBPBTAB, FASTDEC, FASTGAIN, FLOORTAB, HTH, LATAB, MANT_LEVEL_3,
+    MANT_LEVEL_5, MANT_LEVEL_7, MANT_LEVEL_11, MANT_LEVEL_15, MASKTAB, QUANTIZATION_BITS, SLOWDEC,
     SLOWGAIN, WINDOW,
 };
 
@@ -300,10 +300,18 @@ pub struct Ac3State {
     pub audblk_start_bits: u64,
     /// Which block we are currently parsing (0..6).
     pub blkidx: usize,
-    /// 16-bit LFSR state driving the `bap=0` dither replacement
+    /// Generator state (non-zero) driving the `bap=0` dither replacement
     /// (§7.3.4). Persisted across audio blocks and syncframes so the
     /// dither sequence has a smooth long-period character.
     pub dither_lfsr_state: u32,
+    /// Per bin of the coupling region: was this block's coupling-channel
+    /// mantissa a `bap = 0` (zero-bit) mantissa? §7.3.4 applies dither
+    /// to those bins AFTER each channel is extracted from the coupling
+    /// channel, per channel (so the dither is uncorrelated between
+    /// channels), gated by that channel's `dithflag`. Set by the
+    /// standard coupling-mantissa read; cleared by the coupling-AHT path
+    /// (AHT zero-bit coefficients are not dither-substituted).
+    pub cpl_bap0: [bool; N_COEFFS],
     /// Monotonically increasing syncframe counter used for trace gating
     /// (e.g. `AC3_TRACE_FRAME=14`). Incremented at the top of every
     /// `decode_frame` call. Not part of the spec — diagnostic only.
@@ -389,6 +397,7 @@ impl Ac3State {
             // Non-zero seed so the LFSR doesn't get stuck on all-zeros.
             // Arbitrary fixed value keeps decodes byte-reproducible.
             dither_lfsr_state: 0x1234,
+            cpl_bap0: [false; N_COEFFS],
             frame_counter: 0,
             skip_decouple: false,
             ecpl_state: crate::eac3::ecpl::EcplState::new(),
@@ -483,7 +492,7 @@ pub fn decode_frame(
                 }
             }
         }
-        if std::env::var("AC3_TRACE_BITPOS").is_ok() {
+        if debug_env("AC3_TRACE_BITPOS").is_some() {
             // Round-12 diagnostic: verify per-block bit-cursor lands inside
             // the syncframe (frame_bits ≈ 6104 for a 192 kbps frame; CRC
             // and a few padding bits sit between the last block's end and
@@ -573,17 +582,13 @@ pub(crate) fn parse_audblk_into(
         let dynrng = br.read_u32(8)? as u8;
         side.dynrng = dynrng;
         let g = state.drc.resolve_block_gain(dynrng, compr_ch1);
-        for ch in 0..nfchans {
-            state.channels[ch].dynrng = g;
-        }
+        set_program_dynrng(state, nfchans, bsi.lfeon, g);
     } else if blk == 0 {
         // §7.7.1.2 — block 0 with no dynrng word uses '0000 0000' (0 dB).
         // In RF mode that 0 dB dynrng still yields to the frame's compr
         // word, so route the block-0 default through the same resolver.
         let g = state.drc.resolve_block_gain(0x00, compr_ch1);
-        for ch in 0..nfchans {
-            state.channels[ch].dynrng = g;
-        }
+        set_program_dynrng(state, nfchans, bsi.lfeon, g);
     }
     // §5.4.3.5 dynrng2e — dual-mono ch2 dynamic-range present (1 bit),
     // §5.4.3.6 dynrng2 — dual-mono ch2 dynamic-range word (8 bits).
@@ -688,7 +693,7 @@ pub(crate) fn parse_audblk_into(
                             (cplcomant + 16) as f32 / 32.0
                         };
                         let shift = cplcoexp + 3 * mstrcplco;
-                        state.cpl_coord[ch][bnd] = mant * 2f32.powi(-shift);
+                        state.cpl_coord[ch][bnd] = mant * pow2_neg(shift);
                     }
                     state.cpl_coord_valid[ch] = true;
                 }
@@ -717,7 +722,7 @@ pub(crate) fn parse_audblk_into(
                 side.rematflg[rbnd] = v;
             }
         }
-        if std::env::var("AC3_TRACE_REMAT").is_ok() {
+        if debug_env("AC3_TRACE_REMAT").is_some() {
             eprintln!(
                 "TRACE-REMAT blk={} rematstr={} rematflg={:?}",
                 blk, rematstr, state.rematflg
@@ -789,7 +794,7 @@ pub(crate) fn parse_audblk_into(
                 }
             }
         }
-        if std::env::var("AC3_TRACE_CPL").is_ok() {
+        if debug_env("AC3_TRACE_CPL").is_some() {
             eprintln!(
                 "TRACE-CPL blk={} cplexpstr={} cplabsexp={} (<<1={}) ncplgrps={} grpsize={}",
                 blk,
@@ -1025,7 +1030,7 @@ pub(crate) fn parse_audblk_into(
     }
 
     // --- unpack mantissas ---
-    if std::env::var("AC3_DEBUG_FULL").is_ok() && blk == 0 {
+    if debug_env("AC3_DEBUG_FULL").is_some() && blk == 0 {
         let mut histo = [0u32; 16];
         for ch in 0..nfchans {
             let end = state.channels[ch].end_mant;
@@ -1180,11 +1185,7 @@ pub(crate) fn remat_band_count_spx(
             remat_band_count(true, cplbegf)
         }
     } else if spx_in_use {
-        if spx_begin_subbnd < 4 {
-            3
-        } else {
-            4
-        }
+        if spx_begin_subbnd < 4 { 3 } else { 4 }
     } else {
         4
     }
@@ -1229,6 +1230,17 @@ pub(crate) fn decode_exponents(
 /// §7.2.2.1.1 special-case test: `csnroffst`, every `fsnroffst[ch]`,
 /// `cplfsnroffst` (when coupling is in use) and `lfefsnroffst` (when
 /// the LFE is on) are all zero.
+/// Store the resolved §7.7.1 dynamic-range gain for the program's
+/// channels: every fbw channel and, when `lfeon`, the LFE slot
+/// (`MAX_FBW + 1`). §5.4.3.4 / §6.1.9 scale "the reproduced audio" of
+/// the block as a whole; only 1+1 mode (acmod 0) overrides Ch2 with
+/// `dynrng2` afterwards.
+pub(crate) fn set_program_dynrng(state: &mut Ac3State, nfchans: usize, lfeon: bool, gain: f32) {
+    for ch in (0..nfchans).chain(lfeon.then_some(MAX_FBW + 1)) {
+        state.channels[ch].dynrng = gain;
+    }
+}
+
 pub(crate) fn all_snr_offsets_zero(
     state: &Ac3State,
     nfchans: usize,
@@ -1519,74 +1531,72 @@ pub(crate) fn run_bit_allocation(
     // Dumps bndpsd / excite / mask / bap for the requested frame+block. Used
     // to compare against the validator binary's decode of the same fixture.
     // Cheap when the env vars aren't set.
-    let trace_frame = std::env::var("AC3_TRACE_FRAME")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok());
-    let trace_blk = std::env::var("AC3_TRACE_BLK")
-        .ok()
+    let trace_frame = debug_env("AC3_TRACE_FRAME").and_then(|s| s.parse::<u64>().ok());
+    let trace_blk = debug_env("AC3_TRACE_BLK")
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(0);
-    if let Some(tf) = trace_frame {
-        if tf == state.frame_counter && state.blkidx == trace_blk {
-            let label = if is_coupling {
-                "cpl".to_string()
-            } else if ch == MAX_FBW + 1 {
-                "lfe".to_string()
-            } else {
-                format!("ch{ch}")
-            };
-            eprintln!(
-                "TRACE frame={} blk={} {} bndstrt={} bndend={} start={} end={} fgain={:#x} sgain={:#x} fdecay={:#x} sdecay={:#x} dbknee={:#x} floor={:#x} snroffset={:#x}",
-                state.frame_counter,
-                state.blkidx,
-                label,
-                bndstrt,
-                bndend,
-                start,
-                end,
-                fgain,
-                sgain,
-                fdecay,
-                sdecay,
-                dbknee,
-                floor,
-                snroffset
-            );
-            eprintln!(
-                "TRACE  exp[0..bndend]: {:?}",
-                &state.channels[ch].exp[start..start + bndend.min(20)]
-            );
-            eprintln!(
-                "TRACE  psd[0..bndend]: {:?}",
-                &state.channels[ch].psd[start..start + bndend.min(20)]
-            );
-            eprintln!(
-                "TRACE  bndpsd[bndstrt..bndend]: {:?}",
-                &state.channels[ch].bndpsd[bndstrt..bndend]
-            );
-            eprintln!(
-                "TRACE  excite[bndstrt..bndend]: {:?}",
-                &excite[bndstrt..bndend]
-            );
-            eprintln!("TRACE  mask[bndstrt..bndend]: {:?}", &mask[bndstrt..bndend]);
-            eprintln!(
-                "TRACE  bap[start..end]: {:?}",
-                &state.channels[ch].bap[start..end.min(start + 30)]
-            );
-            // Re-derive the lowcomp progression for the first 7 bins so we
-            // can audit calc_lowcomp by hand against the spec table.
-            if bndstrt == 0 && !is_coupling {
-                let mut lc = 0i32;
-                let bp = |i: usize| state.channels[ch].bndpsd[i.min(49)] as i32;
-                eprint!("TRACE  lowcomp progression: ");
-                for bin in 0..7.min(bndend) {
-                    if bin + 1 < 50 {
-                        lc = calc_lowcomp(lc, bp(bin), bp(bin + 1), bin);
-                    }
-                    eprint!("[bin={} lc={}] ", bin, lc);
+    if let Some(tf) = trace_frame
+        && tf == state.frame_counter
+        && state.blkidx == trace_blk
+    {
+        let label = if is_coupling {
+            "cpl".to_string()
+        } else if ch == MAX_FBW + 1 {
+            "lfe".to_string()
+        } else {
+            format!("ch{ch}")
+        };
+        eprintln!(
+            "TRACE frame={} blk={} {} bndstrt={} bndend={} start={} end={} fgain={:#x} sgain={:#x} fdecay={:#x} sdecay={:#x} dbknee={:#x} floor={:#x} snroffset={:#x}",
+            state.frame_counter,
+            state.blkidx,
+            label,
+            bndstrt,
+            bndend,
+            start,
+            end,
+            fgain,
+            sgain,
+            fdecay,
+            sdecay,
+            dbknee,
+            floor,
+            snroffset
+        );
+        eprintln!(
+            "TRACE  exp[0..bndend]: {:?}",
+            &state.channels[ch].exp[start..start + bndend.min(20)]
+        );
+        eprintln!(
+            "TRACE  psd[0..bndend]: {:?}",
+            &state.channels[ch].psd[start..start + bndend.min(20)]
+        );
+        eprintln!(
+            "TRACE  bndpsd[bndstrt..bndend]: {:?}",
+            &state.channels[ch].bndpsd[bndstrt..bndend]
+        );
+        eprintln!(
+            "TRACE  excite[bndstrt..bndend]: {:?}",
+            &excite[bndstrt..bndend]
+        );
+        eprintln!("TRACE  mask[bndstrt..bndend]: {:?}", &mask[bndstrt..bndend]);
+        eprintln!(
+            "TRACE  bap[start..end]: {:?}",
+            &state.channels[ch].bap[start..end.min(start + 30)]
+        );
+        // Re-derive the lowcomp progression for the first 7 bins so we
+        // can audit calc_lowcomp by hand against the spec table.
+        if bndstrt == 0 && !is_coupling {
+            let mut lc = 0i32;
+            let bp = |i: usize| state.channels[ch].bndpsd[i.min(49)] as i32;
+            eprint!("TRACE  lowcomp progression: ");
+            for bin in 0..7.min(bndend) {
+                if bin + 1 < 50 {
+                    lc = calc_lowcomp(lc, bp(bin), bp(bin + 1), bin);
                 }
-                eprintln!();
+                eprint!("[bin={} lc={}] ", bin, lc);
             }
+            eprintln!();
         }
     }
 }
@@ -1623,23 +1633,76 @@ fn calc_lowcomp(a: i32, b0: i32, b1: i32, bin: usize) -> i32 {
     a
 }
 
-/// 16-bit Galois LFSR used to generate dither for `bap=0` mantissas
-/// (§7.3.4). The spec says "any reasonably random sequence may be
-/// used" — we use the classic x^16 + x^14 + x^13 + x^11 + 1 polynomial
-/// because it has a maximal 65535-sample period and the output looks
-/// like white noise to within a few bits. Seed is arbitrary but
-/// fixed so decodes are deterministic.
+/// Dither value for a `bap = 0` mantissa (§7.3.4): uniform in
+/// `[-0.707, 0.707)`, the spec's "optimum" scaling.
+///
+/// The spec leaves the sequence to the decoder ("any reasonably random
+/// sequence may be used"). Each call advances a 32-bit xorshift
+/// generator one full step and takes 16 well-mixed bits, so successive
+/// values — which land on adjacent transform coefficients — are
+/// uncorrelated. (The previous generator shifted a 16-bit register by a
+/// single bit per value and returned the whole register: neighbouring
+/// values `x` and `2x mod 1` correlate at 0.5, and a register with few
+/// bits set produced runs of near-identical full-scale values — dither
+/// that was neither spectrally flat within a block nor steady in level
+/// from block to block.) The seed is fixed so decodes are deterministic.
 pub(crate) fn dither_lfsr(state: &mut u32) -> f32 {
-    // Advance the 16-bit LFSR one step and return a uniform value in
-    // the range `[-0.707, 0.707)` — the spec's "optimum" scaling
-    // (0.707 ≈ 1/√2). Uses the classic Fibonacci taps at bits
-    // 15, 13, 12, 10 of a 16-bit state.
-    let bit = ((*state >> 15) ^ (*state >> 13) ^ (*state >> 12) ^ (*state >> 10)) & 1;
-    *state = ((*state << 1) | bit) & 0xFFFF;
-    // Center around zero: bit15 of the 16-bit state becomes the sign,
-    // lower 15 bits provide magnitude.
-    let signed = (*state as i32).wrapping_sub(0x8000) as f32 / 32768.0;
-    signed * 0.707
+    let mut x = *state;
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    *state = x;
+    let word = x.wrapping_mul(0x9E37_79B1) >> 16;
+    (word as i32 - 0x8000) as f32 / 32768.0 * 0.707
+}
+
+/// `2^-e` for `e` in `0..64`, by exact halving.
+const POW2_NEG: [f32; 64] = {
+    let mut table = [1.0f32; 64];
+    let mut i = 1;
+    while i < 64 {
+        table[i] = table[i - 1] * 0.5;
+        i += 1;
+    }
+    table
+};
+
+/// `2^-e` — the exponent scaling of a mantissa (§7.3), a coupling
+/// coordinate (§7.4.3) or a quantiser step. Tabulated for the range
+/// exponents take (every entry is an exact power of two, as `powi`
+/// returns); anything outside falls back to `powi`.
+#[inline]
+pub(crate) fn pow2_neg(e: i32) -> f32 {
+    if (0..64).contains(&e) {
+        POW2_NEG[e as usize]
+    } else {
+        2f32.powi(-e)
+    }
+}
+
+/// A debug / trace switch from the process environment.
+///
+/// The decoder consults these switches several times per audio block;
+/// the environment is read once per process (a lookup takes the
+/// environment lock and scans every variable) and answered from a
+/// table afterwards.
+pub(crate) fn debug_env(name: &'static str) -> Option<&'static str> {
+    const NAMES: [&str; 9] = [
+        "AC3_TRACE_BITPOS",
+        "AC3_TRACE_REMAT",
+        "AC3_TRACE_CPL",
+        "AC3_DEBUG_FULL",
+        "AC3_TRACE_FRAME",
+        "AC3_TRACE_BLK",
+        "AC3_TRACE_MANT",
+        "EAC3_DUMP_BLK",
+        "EAC3_TRACE_CHANMAP",
+    ];
+    static VALUES: std::sync::OnceLock<[Option<String>; 9]> = std::sync::OnceLock::new();
+    let values = VALUES.get_or_init(|| NAMES.map(|name| std::env::var(name).ok()));
+    let index = NAMES.iter().position(|&known| known == name);
+    debug_assert!(index.is_some(), "{name} is not a tabulated debug switch");
+    index.and_then(|index| values[index].as_deref())
 }
 
 /// Unpack + dequantize mantissas for all channels (§7.3).
@@ -1674,14 +1737,11 @@ pub(crate) fn unpack_mantissas(state: &mut Ac3State, bsi: &Bsi, br: &mut BitRead
     // `AC3_TRACE_BLK=B` plus `AC3_TRACE_MANT=1`. Used by maintainers when
     // chasing bit-stream alignment issues; off by default to keep the
     // hot path clean.
-    let trace_mant_frame = std::env::var("AC3_TRACE_FRAME")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok());
-    let trace_mant_blk = std::env::var("AC3_TRACE_BLK")
-        .ok()
+    let trace_mant_frame = debug_env("AC3_TRACE_FRAME").and_then(|s| s.parse::<u64>().ok());
+    let trace_mant_blk = debug_env("AC3_TRACE_BLK")
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(0);
-    let trace_mant_on = std::env::var("AC3_TRACE_MANT").is_ok();
+    let trace_mant_on = debug_env("AC3_TRACE_MANT").is_some();
     for ch in 0..nfchans {
         let end = state.channels[ch].end_mant;
         let dith = state.channels[ch].dithflag;
@@ -1721,7 +1781,7 @@ pub(crate) fn unpack_mantissas(state: &mut Ac3State, bsi: &Bsi, br: &mut BitRead
                 val
             };
             let e = state.channels[ch].exp[bin] as i32;
-            state.channels[ch].coeffs[bin] = final_val * 2f32.powi(-e);
+            state.channels[ch].coeffs[bin] = final_val * pow2_neg(e);
             if trace_this && bin < 32 {
                 eprintln!(
                     "TRACE-MANT ch{} bin={:3} bap={:2} exp={:2} bit_pos_before={} mant={:.5} dither_used={} coeff={:.5e}",
@@ -1742,9 +1802,11 @@ pub(crate) fn unpack_mantissas(state: &mut Ac3State, bsi: &Bsi, br: &mut BitRead
             let cplc = MAX_FBW;
             for bin in start..end_c {
                 let bap = state.channels[cplc].bap[bin];
-                // Coupling-channel mantissas are never dithered — the
-                // spec explicitly says dither is applied after a channel
-                // is extracted from the coupling channel (§7.3.4 para 1).
+                // The coupling-channel mantissa itself is not dithered:
+                // §7.3.4 applies dither after each channel is extracted
+                // from the coupling channel (see `dsp_block`), so only
+                // the zero-bit position is recorded here.
+                state.cpl_bap0[bin] = bap == 0;
                 let val = fetch_mantissa(
                     br,
                     bap,
@@ -1757,7 +1819,7 @@ pub(crate) fn unpack_mantissas(state: &mut Ac3State, bsi: &Bsi, br: &mut BitRead
                     false,
                 )?;
                 let e = state.channels[cplc].exp[bin] as i32;
-                state.channels[cplc].coeffs[bin] = val * 2f32.powi(-e);
+                state.channels[cplc].coeffs[bin] = val * pow2_neg(e);
             }
             got_cplchan = true;
         }
@@ -1784,7 +1846,7 @@ pub(crate) fn unpack_mantissas(state: &mut Ac3State, bsi: &Bsi, br: &mut BitRead
                 val
             };
             let e = state.channels[lfe_ch].exp[bin] as i32;
-            state.channels[lfe_ch].coeffs[bin] = final_val * 2f32.powi(-e);
+            state.channels[lfe_ch].coeffs[bin] = final_val * pow2_neg(e);
         }
     }
     Ok(())
@@ -1868,7 +1930,7 @@ pub(crate) fn fetch_mantissa(
             let shift = 32 - nbits;
             let signed = (raw << shift) >> shift;
             // Normalize to (-1, 1): divide by 2^(nbits-1).
-            let scale = 2f32.powi(-(nbits as i32 - 1));
+            let scale = pow2_neg(nbits as i32 - 1);
             Ok(signed as f32 * scale)
         }
         _ => Ok(0.0),
@@ -2185,13 +2247,27 @@ pub(crate) fn dsp_block(state: &mut Ac3State, _si: &SyncInfo, bsi: &Bsi) {
             if !state.channels[ch].in_coupling {
                 continue;
             }
+            // §7.3.4: "Dither is applied after the individual channels
+            // are extracted from the coupling channel. In this way, the
+            // dither applied to each channel's upper frequencies is
+            // uncorrelated." A zero-bit coupling mantissa becomes, in each
+            // extracted channel whose dithflag is set, a fresh dither
+            // value taking the mantissa's place — then the same
+            // `>> exponent` and coordinate scaling as a coded mantissa.
+            let dith = state.channels[ch].dithflag;
             for sbnd_off in 0..nsub {
                 let band = sbnd2bnd[sbnd_off];
                 let coord = state.cpl_coord[ch][band] * 8.0;
                 let base = start + sbnd_off * 12;
                 let limit = (base + 12).min(end);
                 for bin in base..limit {
-                    let mut v = state.channels[cpl_ch].coeffs[bin] * coord;
+                    let cpl_val = if dith && state.cpl_bap0[bin] {
+                        let e = state.channels[cpl_ch].exp[bin] as i32;
+                        dither_lfsr(&mut state.dither_lfsr_state) * pow2_neg(e)
+                    } else {
+                        state.channels[cpl_ch].coeffs[bin]
+                    };
+                    let mut v = cpl_val * coord;
                     // phase flag for right channel in 2/0.
                     if acmod == 0x2 && ch == 1 && state.cpl_phsflg[band] {
                         v = -v;
@@ -2269,8 +2345,12 @@ pub(crate) fn dsp_block(state: &mut Ac3State, _si: &SyncInfo, bsi: &Bsi) {
     // `in_spx`, so this is a no-op there.
     apply_spectral_extension(state, nfchans);
 
-    // --- Dynrng scaling ---
-    for ch in 0..nfchans {
+    // --- Dynrng scaling (§6.1.9 / §7.7.1) ---
+    // The word scales the block's reproduced audio: every fbw channel
+    // and, when present, the LFE channel (§5.4.3.4 names no exception;
+    // only 1+1 mode splits the program into dynrng / dynrng2 per
+    // channel, and the LFE then follows the Ch1 word).
+    for ch in (0..nfchans).chain(bsi.lfeon.then_some(MAX_FBW + 1)) {
         let g = state.channels[ch].dynrng;
         if (g - 1.0).abs() > 1e-6 {
             let end = state.channels[ch].end_mant;
@@ -2285,35 +2365,33 @@ pub(crate) fn dsp_block(state: &mut Ac3State, _si: &SyncInfo, bsi: &Bsi) {
     // complex IFFT (N/8 for short blocks) → post-twiddle → de-interleave.
     // Matches the direct-form reference within f32 precision on the long
     // path; the short path is validated by the validator-fixture RMS gate.
-    let trace_frame_dsp = std::env::var("AC3_TRACE_FRAME")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok());
-    let trace_blk_dsp = std::env::var("AC3_TRACE_BLK")
-        .ok()
+    let trace_frame_dsp = debug_env("AC3_TRACE_FRAME").and_then(|s| s.parse::<u64>().ok());
+    let trace_blk_dsp = debug_env("AC3_TRACE_BLK")
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(0);
     for ch in 0..nfchans {
         let mut coeffs = [0.0f32; 256];
         coeffs.copy_from_slice(&state.channels[ch].coeffs);
-        if let Some(tf) = trace_frame_dsp {
-            if tf == state.frame_counter && state.blkidx == trace_blk_dsp {
-                let max_abs = coeffs.iter().fold(0.0f32, |a, &b| a.max(b.abs()));
-                let nonzero = coeffs.iter().filter(|&&v| v != 0.0).count();
-                eprintln!(
-                    "TRACE-DSP ch{} pre-IMDCT max|coeff|={:.6e} nonzero_bins={} blksw={} dynrng={}",
-                    ch, max_abs, nonzero, state.channels[ch].blksw, state.channels[ch].dynrng
-                );
-                eprint!("TRACE-DSP ch{} coeff[0..16]: ", ch);
-                for v in &coeffs[..16] {
-                    eprint!("{:.4e} ", v);
-                }
-                eprintln!();
-                eprint!("TRACE-DSP ch{} coeff[16..32]: ", ch);
-                for v in &coeffs[16..32] {
-                    eprint!("{:.4e} ", v);
-                }
-                eprintln!();
+        if let Some(tf) = trace_frame_dsp
+            && tf == state.frame_counter
+            && state.blkidx == trace_blk_dsp
+        {
+            let max_abs = coeffs.iter().fold(0.0f32, |a, &b| a.max(b.abs()));
+            let nonzero = coeffs.iter().filter(|&&v| v != 0.0).count();
+            eprintln!(
+                "TRACE-DSP ch{} pre-IMDCT max|coeff|={:.6e} nonzero_bins={} blksw={} dynrng={}",
+                ch, max_abs, nonzero, state.channels[ch].blksw, state.channels[ch].dynrng
+            );
+            eprint!("TRACE-DSP ch{} coeff[0..16]: ", ch);
+            for v in &coeffs[..16] {
+                eprint!("{:.4e} ", v);
             }
+            eprintln!();
+            eprint!("TRACE-DSP ch{} coeff[16..32]: ", ch);
+            for v in &coeffs[16..32] {
+                eprint!("{:.4e} ", v);
+            }
+            eprintln!();
         }
         let mut time = [0.0f32; 512];
         if state.channels[ch].blksw {
@@ -2443,6 +2521,59 @@ pub fn imdct_512(x: &[f32; 256], out: &mut [f32; 512]) {
             s += x[k] * phase.cos();
         }
         out[nn] = scale * s;
+    }
+}
+
+#[cfg(test)]
+mod dither_tests {
+    use super::*;
+
+    /// §7.3.4 dither: uniform in ±0.707, and — because successive values
+    /// fill adjacent transform coefficients — uncorrelated from one value
+    /// to the next, with no runs of near-identical values.
+    #[test]
+    fn dither_values_are_uniform_and_uncorrelated() {
+        let mut state = 0x1234_u32;
+        let n = 200_000;
+        let values: Vec<f64> = (0..n).map(|_| f64::from(dither_lfsr(&mut state))).collect();
+        assert!(values.iter().all(|v| v.abs() <= f64::from(0.707_f32)));
+        let mean = values.iter().sum::<f64>() / n as f64;
+        let variance = values.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / n as f64;
+        assert!(mean.abs() < 0.005, "mean {mean}");
+        // Uniform on ±a has variance a² / 3.
+        let want = 0.707_f64 * 0.707 / 3.0;
+        assert!((variance / want - 1.0).abs() < 0.02, "variance {variance}");
+        for lag in 1..=16 {
+            let correlation = values
+                .iter()
+                .zip(&values[lag..])
+                .map(|(a, b)| (a - mean) * (b - mean))
+                .sum::<f64>()
+                / ((n - lag) as f64 * variance);
+            assert!(
+                correlation.abs() < 0.02,
+                "lag {lag}: correlation {correlation}"
+            );
+        }
+        // Block-level steadiness: the power of every 12-value group (one
+        // coupling sub-band) stays below three times nominal — a uniform
+        // variable peaks at exactly three times its mean power, so only
+        // a run of full-scale values reaches it.
+        for (index, group) in values.as_chunks::<12>().0.iter().enumerate() {
+            let power = group.iter().map(|v| v * v).sum::<f64>() / 12.0;
+            assert!(power < 2.6 * want, "group {index}: power {power}");
+        }
+        // A small seed (the reseed path accepts any non-zero value) is
+        // mixed from the first draw on.
+        let mut small = 1_u32;
+        let first: Vec<f32> = (0..8).map(|_| dither_lfsr(&mut small)).collect();
+        let spread = first.iter().fold(0.0_f32, |acc, v| acc.max(v.abs()));
+        assert!(spread > 0.2, "{first:?}");
+        assert!(
+            first
+                .windows(2)
+                .all(|pair| (pair[0] - pair[1]).abs() > 1.0e-3)
+        );
     }
 }
 
@@ -2802,7 +2933,7 @@ mod spx_tests {
         assert!((coeffs[12] - 0.125).abs() < 1e-6);
         assert!((coeffs[13] - 0.25).abs() < 1e-6); // mirror
         assert!((coeffs[14] - 0.5).abs() < 1e-6); // mirror
-                                                  // Outside the 5-tap window, coefficients are untouched.
+        // Outside the 5-tap window, coefficients are untouched.
         assert_eq!(coeffs[9], 1.0);
         assert_eq!(coeffs[15], 1.0);
     }

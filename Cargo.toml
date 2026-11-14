@@ -1,8 +1,8 @@
 [package]
 name = "oxideav-ac3"
-version = "0.0.11"
-edition = "2021"
-rust-version = "1.80"
+version = "0.0.12"
+edition = "2024"
+rust-version = "1.95"
 # MIT, except src/ffdec (a port of FFmpeg's decoder): LGPL-2.1-or-later.
 license = "MIT AND LGPL-2.1-or-later"
 repository = "https://github.com/OxideAV/oxideav-ac3"

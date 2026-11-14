@@ -9,13 +9,13 @@ use std::sync::LazyLock;
 
 use super::bits::BitReader;
 use super::dsp::{
-    calc_bap, calc_mask, calc_psd, kbd_window, vector_fmul_window, BitAllocParams, Dba, Imdct, Lfg,
-    AC3_CRITICAL_BANDS, AC3_MAX_COEFS, DBA_NEW, DBA_NONE, DBA_RESERVED,
+    AC3_CRITICAL_BANDS, AC3_MAX_COEFS, BitAllocParams, DBA_NEW, DBA_NONE, DBA_RESERVED, Dba, Imdct,
+    Lfg, calc_bap, calc_mask, calc_psd, kbd_window, vector_fmul_window,
 };
 use super::header::{
-    find_syncword, parse_header, HeaderInfo, ParseError, AC3_CHMODE_MONO, AC3_CHMODE_STEREO,
-    EAC3_FRAME_TYPE_DEPENDENT, EAC3_FRAME_TYPE_INDEPENDENT, EAC3_FRAME_TYPE_RESERVED,
-    EAC3_MAX_CHANNELS, EAC3_SR_CODE_REDUCED,
+    AC3_CHMODE_MONO, AC3_CHMODE_STEREO, EAC3_FRAME_TYPE_DEPENDENT, EAC3_FRAME_TYPE_INDEPENDENT,
+    EAC3_FRAME_TYPE_RESERVED, EAC3_MAX_CHANNELS, EAC3_SR_CODE_REDUCED, HeaderInfo, ParseError,
+    find_syncword, parse_header,
 };
 use super::tables::*;
 use super::vq_tables::*;

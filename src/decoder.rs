@@ -6,17 +6,22 @@
 //! 2da55bf's output, layout reported through
 //! `Decoder::output_audio_format`.
 //!
-//! The opt-in factories ([`make_decoder_ltrt`], [`make_decoder_with_drc`],
-//! [`make_eac3_decoder_with_joc`]) keep the crate's native decoder for
-//! the features they select: it runs the §7 DSP pipeline (syncinfo + BSI
-//! parsing, exponent decode, parametric bit allocation, mantissa
+//! The opt-in factories ([`make_native_decoder`], [`make_decoder_ltrt`],
+//! [`make_decoder_with_drc`], [`make_eac3_decoder_with_joc`], and the
+//! `joc_layout` routes [`make_eac3_decoder_with_options`] /
+//! [`make_eac3_decoder_with_joc_layout`]) keep the crate's native decoder
+//! for the features they select: it runs the §7 DSP pipeline (syncinfo +
+//! BSI parsing, exponent decode, parametric bit allocation, mantissa
 //! dequantization, decoupling, rematrixing, dynamic-range scaling, IMDCT
-//! with KBD window and overlap-add) and emits 1536 interleaved S16 samples
-//! per channel and syncframe, downmixed to the container's channel count.
+//! with KBD window and overlap-add) and emits 1536 interleaved samples per
+//! channel and syncframe (S16, or F32 with
+//! `CodecParameters::sample_format`), downmixed to the container's channel
+//! count.
 
 use oxideav_core::Decoder;
 use oxideav_core::{
-    AudioFrame, CodecId, CodecParameters, Error, Frame, Packet, Result, SampleFormat, TimeBase,
+    AudioFrame, CodecId, CodecOptions, CodecOptionsStruct, CodecParameters, Error, Frame,
+    OptionField, OptionKind, OptionValue, Packet, Result, SampleFormat, TimeBase, parse_options,
 };
 
 use crate::audblk::{self, Ac3State, BLOCKS_PER_FRAME, SAMPLES_PER_BLOCK};
@@ -25,6 +30,7 @@ use crate::crc::{self, CrcStatus};
 use crate::downmix::{Downmix, DownmixMode};
 use crate::drc::DrcSettings;
 use crate::eac3;
+use crate::eac3::JocLayout;
 use crate::eac3::joc_renderer::JocRenderer;
 use crate::syncinfo::{self, SyncInfo};
 use crate::wave_order;
@@ -45,8 +51,20 @@ pub fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
 /// The E-AC-3 decoder: the same decoder as [`make_decoder`], registered
 /// under the `eac3` codec id so the registry's container-tag lookup hits
 /// it for `A_EAC3` / `0xA7` / etc.
+///
+/// The `joc_layout` entry of `params.options` (see
+/// [`Eac3DecoderOptions`]) selects a rendered JOC object presentation —
+/// the registry path to [`make_eac3_decoder_with_options`]. That
+/// presentation is the crate's own object renderer, which FFmpeg's
+/// decoder does not have, so a layout returns the native decoder;
+/// without one the output is FFmpeg's. Other keys of the bag are
+/// ignored.
 pub fn make_eac3_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
-    Ok(Box::new(crate::ffdec::FfAc3Decoder::new(params)))
+    let options = Eac3DecoderOptions::from_codec_options(&params.options)?;
+    match options.joc_layout {
+        None => Ok(Box::new(crate::ffdec::FfAc3Decoder::new(params))),
+        Some(_) => make_eac3_decoder_with_options(params, &options),
+    }
 }
 
 /// The crate's native decoder with its defaults: interleaved S16 in WAV
@@ -56,19 +74,114 @@ pub fn make_eac3_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub fn make_native_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
-    Ok(Box::new(Ac3Decoder {
-        codec_id: params.codec_id.clone(),
-        time_base: TimeBase::new(1, 48_000),
-        pending: None,
-        eof: false,
-        state: Ac3State::new(),
-        eac3_state: eac3::Eac3DecoderState::default(),
-        requested_channels: params.channels,
-        prefer_ltrt: false,
-        drc: DrcSettings::default(),
-        render_joc_stereo: false,
-        joc_renderer: JocRenderer::default(),
-    }))
+    Ok(Box::new(Ac3Decoder::new(params, false, None)))
+}
+
+/// Decoder options of the E-AC-3 decoder.
+///
+/// On the registry path the same options travel in
+/// `CodecParameters::options`:
+///
+/// | key | values | meaning |
+/// | --- | --- | --- |
+/// | `joc_layout` | `stereo`, `5.1`, `5.1.2`, `5.1.4`, `7.1`, `7.1.2`, `7.1.4`, `9.1.6` | render the JOC object presentation to this speaker layout |
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Eac3DecoderOptions {
+    /// Speaker layout the JOC object presentation is rendered to;
+    /// `None` (the default) keeps the channel-based decode.
+    pub joc_layout: Option<JocLayout>,
+}
+
+impl Eac3DecoderOptions {
+    /// Options with every field at its default.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Render the JOC object presentation to `layout`.
+    pub fn with_joc_layout(mut self, layout: JocLayout) -> Self {
+        self.joc_layout = Some(layout);
+        self
+    }
+
+    /// Read the options this decoder knows from an option bag, ignoring
+    /// every other key. A malformed value of a known key is an error.
+    pub fn from_codec_options(bag: &CodecOptions) -> Result<Self> {
+        let mut known = CodecOptions::new();
+        for (key, value) in bag.iter() {
+            if Self::SCHEMA.iter().any(|field| field.name == key) {
+                known.insert(key, value);
+            }
+        }
+        parse_options::<Self>(&known)
+    }
+}
+
+impl CodecOptionsStruct for Eac3DecoderOptions {
+    const SCHEMA: &'static [OptionField] = &[OptionField {
+        name: "joc_layout",
+        kind: OptionKind::Enum(&[
+            "stereo", "5.1", "5.1.2", "5.1.4", "7.1", "7.1.2", "7.1.4", "9.1.6",
+        ]),
+        default: OptionValue::String(String::new()),
+        help: "speaker layout the JOC object presentation is rendered to",
+    }];
+
+    fn apply(&mut self, key: &str, value: &OptionValue) -> Result<()> {
+        if key == "joc_layout" {
+            let layout = value
+                .as_str()?
+                .parse::<JocLayout>()
+                .map_err(|error| Error::invalid(error.to_string()))?;
+            self.joc_layout = Some(layout);
+        }
+        Ok(())
+    }
+}
+
+/// Build an E-AC-3 decoder from typed [`Eac3DecoderOptions`].
+///
+/// With [`Eac3DecoderOptions::joc_layout`] set to a multichannel layout
+/// the decoder **always** outputs that layout, interleaved in
+/// [`JocLayout::speakers`] order and described by
+/// [`Decoder::output_params`]: frames carrying valid 5.X JOC/OAMD
+/// metadata are rendered from the reconstructed objects; every other
+/// frame (no object metadata, a malformed or unsupported presentation,
+/// plain AC-3) has its coded channels routed to their own speakers of
+/// the layout. `params.channels`, when set, must then equal the layout's
+/// channel count. [`JocLayout::Stereo`] is
+/// [`make_eac3_decoder_with_joc`] with a stereo target.
+pub fn make_eac3_decoder_with_options(
+    params: &CodecParameters,
+    options: &Eac3DecoderOptions,
+) -> Result<Box<dyn Decoder>> {
+    let mut decoder = Ac3Decoder::new(params, false, options.joc_layout);
+    if let Some(layout) = options.joc_layout {
+        match params.channels {
+            None => {
+                if layout == JocLayout::Stereo {
+                    decoder.requested_channels = Some(2);
+                }
+            }
+            Some(channels) if channels == layout.channel_count() => {}
+            Some(channels) => {
+                return Err(Error::invalid(format!(
+                    "eac3: {channels} output channels requested with joc_layout={layout} ({} channels)",
+                    layout.channel_count()
+                )));
+            }
+        }
+    }
+    Ok(Box::new(decoder))
+}
+
+/// [`make_eac3_decoder_with_options`] with only the JOC layout set.
+pub fn make_eac3_decoder_with_joc_layout(
+    params: &CodecParameters,
+    layout: JocLayout,
+) -> Result<Box<dyn Decoder>> {
+    make_eac3_decoder_with_options(params, &Eac3DecoderOptions::new().with_joc_layout(layout))
 }
 
 /// Build a native E-AC-3 decoder that prefers the reconstructed JOC object
@@ -79,19 +192,11 @@ pub fn make_native_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>>
 /// unsupported JOC presentations fall back to the same §7.8 compatibility
 /// downmix [`make_native_decoder`] applies.
 pub fn make_eac3_decoder_with_joc(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
-    Ok(Box::new(Ac3Decoder {
-        codec_id: params.codec_id.clone(),
-        time_base: TimeBase::new(1, 48_000),
-        pending: None,
-        eof: false,
-        state: Ac3State::new(),
-        eac3_state: eac3::Eac3DecoderState::default(),
-        requested_channels: params.channels,
-        prefer_ltrt: false,
-        drc: DrcSettings::default(),
-        render_joc_stereo: true,
-        joc_renderer: JocRenderer::default(),
-    }))
+    Ok(Box::new(Ac3Decoder::new(
+        params,
+        false,
+        Some(JocLayout::Stereo),
+    )))
 }
 
 /// Variant of [`make_native_decoder`] that selects the §7.8.2 **LtRt**
@@ -105,19 +210,7 @@ pub fn make_eac3_decoder_with_joc(params: &CodecParameters) -> Result<Box<dyn De
 // internal — exposed for tests/fuzz; not part of the stable API
 #[doc(hidden)]
 pub fn make_decoder_ltrt(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
-    Ok(Box::new(Ac3Decoder {
-        codec_id: params.codec_id.clone(),
-        time_base: TimeBase::new(1, 48_000),
-        pending: None,
-        eof: false,
-        state: Ac3State::new(),
-        eac3_state: eac3::Eac3DecoderState::default(),
-        requested_channels: params.channels,
-        prefer_ltrt: true,
-        drc: DrcSettings::default(),
-        render_joc_stereo: false,
-        joc_renderer: JocRenderer::default(),
-    }))
+    Ok(Box::new(Ac3Decoder::new(params, true, None)))
 }
 
 /// Build a native AC-3 / E-AC-3 decoder with an explicit §6.1.9 / §7.7
@@ -133,19 +226,7 @@ pub fn make_decoder_with_drc(
     params: &CodecParameters,
     drc: DrcSettings,
 ) -> Result<Box<dyn Decoder>> {
-    let mut dec = Ac3Decoder {
-        codec_id: params.codec_id.clone(),
-        time_base: TimeBase::new(1, 48_000),
-        pending: None,
-        eof: false,
-        state: Ac3State::new(),
-        eac3_state: eac3::Eac3DecoderState::default(),
-        requested_channels: params.channels,
-        prefer_ltrt: false,
-        drc: DrcSettings::default(),
-        render_joc_stereo: false,
-        joc_renderer: JocRenderer::default(),
-    };
+    let mut dec = Ac3Decoder::new(params, false, None);
     dec.set_drc(drc);
     Ok(Box::new(dec))
 }
@@ -153,7 +234,12 @@ pub fn make_decoder_with_drc(
 struct Ac3Decoder {
     codec_id: CodecId,
     time_base: TimeBase,
-    pending: Option<Packet>,
+    /// Presentation periods still to be decoded from the last packet
+    /// handed to [`Decoder::send_packet`]. A packet may carry several
+    /// consecutive syncframes (an MPEG-TS PES payload typically does);
+    /// [`split_packet`] cuts it into one entry per period and
+    /// [`Decoder::receive_frame`] drains them in order.
+    pending: std::collections::VecDeque<Packet>,
     eof: bool,
     state: Ac3State,
     /// Per-decoder E-AC-3 state — empty in round 1 (no overlap-add
@@ -165,6 +251,10 @@ struct Ac3Decoder {
     /// stereo, `None` = passthrough of whatever the bitstream carries.
     /// Drives the §7.8 matrix in [`Ac3Decoder::process_frame`].
     requested_channels: Option<u16>,
+    /// `true` when the caller asked for [`SampleFormat::F32`] output
+    /// (`CodecParameters::sample_format`): frames then carry interleaved
+    /// little-endian f32 PCM, unquantised, instead of S16LE.
+    f32_output: bool,
     /// When `true` and a 2-channel downmix is requested, use the
     /// §7.8.2 **LtRt** (Dolby Surround matrix-encoded) equations
     /// instead of LoRo. Toggled by [`make_decoder_ltrt`]; the regular
@@ -178,11 +268,18 @@ struct Ac3Decoder {
     /// default output is the mandatory §7.7.1 decode. Steered via
     /// [`Ac3Decoder::set_drc`].
     drc: DrcSettings,
-    /// Opt-in object-aware stereo presentation. Existing factories leave
-    /// this disabled so adding JOC support does not change their output.
-    render_joc_stereo: bool,
+    /// Opt-in object-aware presentation and its speaker layout. `None`
+    /// (every historical factory) keeps the channel-based decode;
+    /// `Some(Stereo)` renders objects only for a stereo target and falls
+    /// back to the §7.8 downmix; any other layout fixes the output shape
+    /// to that layout.
+    joc_layout: Option<JocLayout>,
     /// Stateful JOC matrices, OAMD properties, and QMF delay lines.
     joc_renderer: JocRenderer,
+    /// Sample rate of the last decoded frame (for `output_params`).
+    last_sample_rate: Option<u32>,
+    /// Bumped when the output description changes mid-stream.
+    params_generation: u64,
 }
 
 impl Decoder for Ac3Decoder {
@@ -191,24 +288,24 @@ impl Decoder for Ac3Decoder {
     }
 
     fn send_packet(&mut self, packet: &Packet) -> Result<()> {
-        if self.pending.is_some() {
+        if !self.pending.is_empty() {
             return Err(Error::other(
                 "AC-3 decoder: receive_frame must be called before sending another packet",
             ));
         }
-        self.pending = Some(packet.clone());
+        self.pending = split_packet(packet);
         Ok(())
     }
 
     fn receive_frame(&mut self) -> Result<Frame> {
-        let pkt = match self.pending.take() {
+        let pkt = match self.pending.pop_front() {
             Some(p) => p,
             None => {
                 return if self.eof {
                     Err(Error::Eof)
                 } else {
                     Err(Error::NeedMore)
-                }
+                };
             }
         };
         self.process_frame(&pkt)
@@ -219,8 +316,28 @@ impl Decoder for Ac3Decoder {
         Ok(())
     }
 
+    fn output_params(&self) -> Option<CodecParameters> {
+        // Only a fixed-layout object presentation has a shape that is
+        // known independently of the stream.
+        let layout = self.fixed_layout()?;
+        let mut params = CodecParameters::audio(self.codec_id.clone());
+        params.channels = Some(layout.channel_count());
+        params.channel_layout = Some(layout.channel_layout());
+        params.sample_format = Some(if self.f32_output {
+            SampleFormat::F32
+        } else {
+            SampleFormat::S16
+        });
+        params.sample_rate = self.last_sample_rate;
+        Some(params)
+    }
+
+    fn output_params_generation(&self) -> u64 {
+        self.params_generation
+    }
+
     fn reset(&mut self) -> Result<()> {
-        self.pending = None;
+        self.pending.clear();
         self.eof = false;
         self.state = Ac3State::new();
         self.eac3_state = eac3::Eac3DecoderState::default();
@@ -234,6 +351,51 @@ impl Decoder for Ac3Decoder {
 }
 
 impl Ac3Decoder {
+    fn new(params: &CodecParameters, prefer_ltrt: bool, joc_layout: Option<JocLayout>) -> Self {
+        Self {
+            codec_id: params.codec_id.clone(),
+            time_base: TimeBase::new(1, 48_000),
+            pending: std::collections::VecDeque::new(),
+            eof: false,
+            state: Ac3State::new(),
+            eac3_state: eac3::Eac3DecoderState::default(),
+            requested_channels: params.channels,
+            f32_output: params.sample_format == Some(SampleFormat::F32),
+            prefer_ltrt,
+            drc: DrcSettings::default(),
+            joc_layout,
+            joc_renderer: JocRenderer::with_layout(joc_layout.unwrap_or_default()),
+            last_sample_rate: None,
+            params_generation: 0,
+        }
+    }
+
+    /// The multichannel layout every output frame has, when one was
+    /// selected.
+    fn fixed_layout(&self) -> Option<JocLayout> {
+        self.joc_layout
+            .filter(|&layout| layout != JocLayout::Stereo)
+    }
+
+    /// Record the sample rate of the frame about to be returned.
+    fn note_sample_rate(&mut self, sample_rate: u32) {
+        if self.last_sample_rate != Some(sample_rate) {
+            if self.last_sample_rate.is_some() && self.fixed_layout().is_some() {
+                self.params_generation = self.params_generation.wrapping_add(1);
+            }
+            self.last_sample_rate = Some(sample_rate);
+        }
+    }
+
+    /// Pack rendered interleaved f32 PCM in the configured sample format.
+    fn pack_output(&self, samples: &[f32]) -> Vec<u8> {
+        if self.f32_output {
+            pack_f32le(samples)
+        } else {
+            pack_f32_to_s16le(samples)
+        }
+    }
+
     /// Configure the §6.1.9 / §7.7 dynamic-range-control + §7.6
     /// dialogue-normalisation behaviour applied to subsequent frames.
     ///
@@ -321,47 +483,95 @@ impl Ac3Decoder {
         // frame from the indep substream's dialnorm word.
         let dn_gain = self.drc.dialnorm_gain(decoded.dialnorm);
 
-        // The JOC presentation is deliberately opt-in and stereo-only.
-        // Metadata or rendering failures are non-fatal: reset all object/QMF
-        // history and continue through the existing compatibility downmix.
-        let joc_stereo = if self.render_joc_stereo && self.requested_channels == Some(2) {
-            match decoded.joc_metadata.as_ref() {
-                Some(metadata) => match self.joc_renderer.render_stereo(
-                    metadata,
-                    self.eac3_state.indep_pcm_f32(),
-                    channels as usize,
-                    decoded.acmod,
-                    decoded.lfeon,
-                ) {
-                    Ok(mut samples) => {
-                        if dn_gain != 1.0 {
-                            for sample in &mut samples {
-                                *sample *= dn_gain;
-                            }
-                        }
-                        Some((pack_f32_to_s16le(&samples), 2_u16))
-                    }
-                    Err(_) => {
-                        self.joc_renderer.reset();
-                        None
-                    }
-                },
+        // The JOC presentation is deliberately opt-in. Metadata or
+        // rendering failures are non-fatal: reset all object/QMF history
+        // and continue through the compatibility path — the §7.8 downmix
+        // for a stereo target, the channel bed routed to its own speakers
+        // for a fixed multichannel layout.
+        let render_objects = match self.joc_layout {
+            Some(JocLayout::Stereo) => self.requested_channels == Some(2),
+            Some(_) => true,
+            None => false,
+        };
+        let mut joc_stereo = None;
+        if render_objects {
+            let rendered = decoded.joc_metadata.as_ref().and_then(|metadata| {
+                self.joc_renderer
+                    .render(
+                        metadata,
+                        self.eac3_state.indep_pcm_f32(),
+                        channels as usize,
+                        decoded.acmod,
+                        decoded.lfeon,
+                    )
+                    .ok()
+            });
+            let rendered = match rendered {
+                Some(samples) => Some(samples),
                 None => {
                     self.joc_renderer.reset();
-                    None
+                    self.fixed_layout().map(|layout| {
+                        let scratch = self.eac3_state.indep_pcm_f32();
+                        let frames = decoded.samples as usize;
+                        if channels != 0 && scratch.len() == frames * channels as usize {
+                            self.joc_renderer.render_channel_bed(
+                                scratch,
+                                channels as usize,
+                                decoded.acmod,
+                                decoded.lfeon,
+                                &decoded.dep_locations,
+                            )
+                        } else {
+                            // A concealed (zero-filled) frame has no f32
+                            // program: keep the layout's shape, silent.
+                            vec![0.0; frames * usize::from(layout.channel_count())]
+                        }
+                    })
                 }
+            };
+            if let Some(mut samples) = rendered {
+                if dn_gain != 1.0 {
+                    for sample in &mut samples {
+                        *sample *= dn_gain;
+                    }
+                }
+                joc_stereo = Some((
+                    self.pack_output(&samples),
+                    self.joc_renderer.layout().channel_count(),
+                ));
             }
-        } else {
-            None
-        };
+        }
 
         let (pcm, out_channels) = if let Some(rendered) = joc_stereo {
             rendered
+        } else if matches!(dmx_mode, DownmixMode::Passthrough) && self.f32_output {
+            let mut samples = self.eac3_state.indep_pcm_f32().to_vec();
+            // Defensive — the scratch carries the indep program plus
+            // every spliced dependent substream, so this only fires
+            // when the eac3 state is out of sync with `decoded`.
+            if samples.len() != decoded.samples as usize * channels as usize {
+                return Err(Error::invalid(format!(
+                    "eac3 f32 output: scratch len {} != frames*ch {}*{}",
+                    samples.len(),
+                    decoded.samples,
+                    channels,
+                )));
+            }
+            for sample in &mut samples {
+                *sample *= dn_gain;
+            }
+            wave_order::reorder_f32_in_place(
+                &mut samples,
+                decoded.acmod,
+                decoded.lfeon,
+                channels as usize,
+            );
+            (pack_f32le(&samples), channels)
         } else if matches!(dmx_mode, DownmixMode::Passthrough) {
             let mut pcm = decoded.pcm_s16le;
             if dn_gain != 1.0 {
                 // Scale the already-quantised S16 samples in place.
-                for chunk in pcm.chunks_exact_mut(2) {
+                for chunk in pcm.as_chunks_mut::<2>().0 {
                     let v = i16::from_le_bytes([chunk[0], chunk[1]]);
                     let scaled = (v as f32 * dn_gain).clamp(-32768.0, 32767.0) as i16;
                     let le = scaled.to_le_bytes();
@@ -421,8 +631,11 @@ impl Ac3Decoder {
             for blk in 0..nblocks {
                 let mut per_ch: [[f32; SAMPLES_PER_BLOCK]; 5] = [[0.0; SAMPLES_PER_BLOCK]; 5];
                 let base = blk * SAMPLES_PER_BLOCK * nchans;
+                // A concealed frame can report fewer program channels
+                // than its `acmod` names (down to none); the channels
+                // it lacks stay silent in the matrix input.
                 for n in 0..SAMPLES_PER_BLOCK {
-                    for ch in 0..nfchans.min(5) {
+                    for ch in 0..nfchans.min(5).min(nchans) {
                         // §7.6 dialnorm scalar folded into the matrix input
                         // (unity unless a dialnorm target is configured).
                         per_ch[ch][n] = src_f32[base + n * nchans + ch] * dn_gain;
@@ -435,18 +648,23 @@ impl Ac3Decoder {
                     &mut out_f32[out_base..out_base + SAMPLES_PER_BLOCK * out_ch],
                 );
             }
-            // Pack f32 → S16LE.
-            let mut out_bytes = vec![0u8; out_f32.len() * 2];
-            for (i, s) in out_f32.iter().enumerate() {
-                let clamped = (s * 32767.0).clamp(-32768.0, 32767.0) as i16;
-                let le = clamped.to_le_bytes();
-                out_bytes[i * 2] = le[0];
-                out_bytes[i * 2 + 1] = le[1];
+            if self.f32_output {
+                (pack_f32le(&out_f32), out_ch as u16)
+            } else {
+                // Pack f32 → S16LE.
+                let mut out_bytes = vec![0u8; out_f32.len() * 2];
+                for (i, s) in out_f32.iter().enumerate() {
+                    let clamped = (s * 32767.0).clamp(-32768.0, 32767.0) as i16;
+                    let le = clamped.to_le_bytes();
+                    out_bytes[i * 2] = le[0];
+                    out_bytes[i * 2 + 1] = le[1];
+                }
+                (out_bytes, out_ch as u16)
             }
-            (out_bytes, out_ch as u16)
         };
 
         self.time_base = TimeBase::new(1, decoded.sample_rate as i64);
+        self.note_sample_rate(decoded.sample_rate);
         let _ = out_channels; // surfaced for future AudioFrame channel-count
         Ok(Frame::Audio(AudioFrame {
             samples: decoded.samples,
@@ -499,6 +717,24 @@ impl Ac3Decoder {
                 *s *= dn_gain;
             }
         }
+        self.note_sample_rate(sample_rate);
+
+        // A fixed object-presentation layout: plain AC-3 carries no
+        // objects, so its channels are routed to their own speakers.
+        if self.fixed_layout().is_some() {
+            let rendered = self.joc_renderer.render_channel_bed(
+                &floats,
+                src_channels as usize,
+                bsi.acmod,
+                bsi.lfeon,
+                &[],
+            );
+            return Ok(Frame::Audio(AudioFrame {
+                samples: SAMPLES_PER_FRAME,
+                pts: pkt.pts,
+                data: vec![self.pack_output(&rendered)],
+            }));
+        }
 
         // 2) Pick a §7.8 downmix mode from the requested output channel
         //    count (falls back to passthrough when unset or equal to
@@ -532,7 +768,7 @@ impl Ac3Decoder {
                 let mut per_ch: [[f32; SAMPLES_PER_BLOCK]; 5] = [[0.0; SAMPLES_PER_BLOCK]; 5];
                 let base = blk * SAMPLES_PER_BLOCK * nchans;
                 for n in 0..SAMPLES_PER_BLOCK {
-                    for ch in 0..nfchans.min(5) {
+                    for ch in 0..nfchans.min(5).min(nchans) {
                         per_ch[ch][n] = floats[base + n * nchans + ch];
                     }
                 }
@@ -545,6 +781,25 @@ impl Ac3Decoder {
             }
             (out_ch as u16, out)
         };
+
+        // 3) F32 output: reorder to WAV-mask order and emit the samples
+        //    as they are.
+        if self.f32_output {
+            let mut out = out_samples;
+            if matches!(dmx_mode, DownmixMode::Passthrough) {
+                wave_order::reorder_f32_in_place(
+                    &mut out,
+                    bsi.acmod,
+                    bsi.lfeon,
+                    out_channels as usize,
+                );
+            }
+            return Ok(Frame::Audio(AudioFrame {
+                samples: SAMPLES_PER_FRAME,
+                pts: pkt.pts,
+                data: vec![pack_f32le(&out)],
+            }));
+        }
 
         // 3) Pack f32 → S16 interleaved.
         let bytes_per_sample = SampleFormat::S16.bytes_per_sample();
@@ -582,6 +837,70 @@ impl Ac3Decoder {
             data: vec![out_bytes],
         }))
     }
+}
+
+/// Cut a packet into one sub-packet per presentation period.
+///
+/// Containers that frame AC-3 themselves (MP4, Matroska, the `.ac3`
+/// demuxer) hand over exactly one period per packet and the split is
+/// the identity. Transport-stream PES payloads carry several
+/// consecutive syncframes; each AC-3 frame, and each E-AC-3 program-0
+/// independent frame together with the dependent / additional-program
+/// frames that follow it (Annex E §E.3.8 — the decoder renders program
+/// 0), becomes its own sub-packet. Timestamps advance by the period's
+/// sample count rescaled into the packet's time base; the duration is
+/// set per period. Bytes that do not parse as a syncframe header where
+/// a frame is expected stay attached to the preceding period (or form
+/// the single sub-packet of an unparsable packet) so the frame decoder
+/// reports them exactly as before.
+fn split_packet(packet: &Packet) -> std::collections::VecDeque<Packet> {
+    use crate::container::parse_sync_frame;
+    let data = &packet.data[..];
+    let mut out = std::collections::VecDeque::new();
+    // Period boundaries: offsets of every program-start syncframe.
+    let mut starts: Vec<(usize, u32, u32)> = Vec::new(); // (offset, samples, sample_rate)
+    let mut off = 0usize;
+    while off + 6 <= data.len() {
+        let Some(f) = parse_sync_frame(&data[off..]) else {
+            break;
+        };
+        if f.program_start {
+            starts.push((off, f.samples, f.sample_rate));
+        }
+        if off + f.len > data.len() {
+            break;
+        }
+        off += f.len;
+    }
+    if starts.len() <= 1 {
+        out.push_back(packet.clone());
+        return out;
+    }
+    let mut pts = packet.pts;
+    let mut dts = packet.dts;
+    for (i, &(start, samples, sample_rate)) in starts.iter().enumerate() {
+        let end = starts.get(i + 1).map_or(data.len(), |n| n.0);
+        let ticks =
+            TimeBase::new(1, i64::from(sample_rate)).rescale(i64::from(samples), packet.time_base);
+        let mut sub = Packet::new(
+            packet.stream_index,
+            packet.time_base,
+            data[start..end].to_vec(),
+        );
+        sub.pts = pts;
+        sub.dts = dts;
+        sub.duration = Some(ticks);
+        sub.flags = packet.flags;
+        out.push_back(sub);
+        pts = pts.map(|p| p.saturating_add(ticks));
+        dts = dts.map(|d| d.saturating_add(ticks));
+    }
+    out
+}
+
+/// Interleaved f32 PCM as little-endian bytes (the F32 output format).
+fn pack_f32le(samples: &[f32]) -> Vec<u8> {
+    samples.iter().flat_map(|s| s.to_le_bytes()).collect()
 }
 
 /// Pack interleaved normalized f32 PCM into the decoder's S16LE output
@@ -1016,6 +1335,51 @@ mod tests {
 
     // -- DRC control surface (§6.1.9 / §7.6 / §7.7) end-to-end tests --
 
+    /// Decode the stereo fixture with the given output sample format and
+    /// return each frame's payload.
+    fn decode_fixture_frames(format: SampleFormat) -> Vec<Vec<u8>> {
+        use oxideav_core::Packet;
+        use oxideav_core::TimeBase as TB;
+        const FIXTURE: &[u8] = include_bytes!("../tests/fixtures/sine440_stereo.ac3");
+        let mut params = CodecParameters::audio(CodecId::new("ac3"));
+        params.sample_rate = Some(48_000);
+        params.sample_format = Some(format);
+        // The opt-in S16/F32 sample-format switch is the native decoder's;
+        // `make_decoder` is FFmpeg's (planar F32P).
+        let mut dec = make_native_decoder(&params).expect("make_native_decoder");
+        let mut frames = Vec::new();
+        for chunk in FIXTURE.as_chunks::<768>().0 {
+            dec.send_packet(&Packet::new(0, TB::new(1, 48_000), chunk.to_vec()))
+                .unwrap();
+            while let Ok(Frame::Audio(af)) = dec.receive_frame() {
+                frames.push(af.data[0].clone());
+            }
+        }
+        frames
+    }
+
+    #[test]
+    fn f32_output_is_the_unquantised_s16_output() {
+        let s16 = decode_fixture_frames(SampleFormat::S16);
+        let f32 = decode_fixture_frames(SampleFormat::F32);
+        assert_eq!(s16.len(), f32.len());
+        assert!(!f32.is_empty());
+        let mut fractional = 0usize;
+        for (a, b) in s16.iter().zip(&f32) {
+            assert_eq!(b.len(), a.len() * 2, "4 bytes per F32 sample");
+            for (q, f) in a.as_chunks::<2>().0.iter().zip(b.as_chunks::<4>().0) {
+                let v = f32::from_le_bytes(*f);
+                // the S16 output is the F32 output quantised as the S16 path does
+                let expect = (v * 32767.0).clamp(-32768.0, 32767.0) as i16;
+                assert_eq!(i16::from_le_bytes(*q), expect);
+                if (v * 32767.0).fract() != 0.0 {
+                    fractional += 1;
+                }
+            }
+        }
+        assert!(fractional > 0, "F32 keeps the precision S16 drops");
+    }
+
     /// Decode the in-tree `sine440_stereo.ac3` validator fixture and
     /// return the RMS of the interleaved S16 output PCM under the supplied
     /// DRC settings.
@@ -1041,7 +1405,7 @@ mod tests {
                 continue;
             }
             while let Ok(Frame::Audio(af)) = dec.receive_frame() {
-                for chunk in af.data[0].chunks_exact(2) {
+                for chunk in af.data[0].as_chunks::<2>().0 {
                     let v = i16::from_le_bytes([chunk[0], chunk[1]]) as f64;
                     sum_sq += v * v;
                     n += 1;

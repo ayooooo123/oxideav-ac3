@@ -46,6 +46,7 @@ impl JocMatrixFrame {
         self.num_channels
     }
 
+    #[cfg(test)]
     pub(super) fn coefficient(
         &self,
         object: usize,
@@ -54,6 +55,13 @@ impl JocMatrixFrame {
         subband: usize,
     ) -> f32 {
         self.values[self.index(object, timeslot, channel, subband)]
+    }
+
+    /// The coefficients of one object / timeslot / channel over the 64
+    /// subbands.
+    pub(super) fn subbands(&self, object: usize, timeslot: usize, channel: usize) -> &[f32] {
+        let start = self.index(object, timeslot, channel, 0);
+        &self.values[start..start + QMF_SUBBANDS]
     }
 
     fn index(&self, object: usize, timeslot: usize, channel: usize, subband: usize) -> usize {
@@ -102,9 +110,9 @@ impl JocMatrixDecoder {
             return Err(JocReconstructionError::Invalid("JOC object-update count"));
         }
 
-        let expected_sequence =
-            self.last_sequence
-                .map(|sequence| if sequence == 1023 { 1 } else { sequence + 1 });
+        let expected_sequence = self
+            .last_sequence
+            .map(|sequence| if sequence == 1023 { 1 } else { sequence + 1 });
         let shape = (num_objects, num_channels);
         if metadata.sequence_count == 0
             || expected_sequence.is_some_and(|expected| expected != metadata.sequence_count)

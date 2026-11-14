@@ -48,7 +48,7 @@ use super::audfrm::{self, AudFrm};
 use super::bsi::{self, Bsi as Eac3Bsi, StreamType};
 use super::chanmap::{self, ChannelLocation};
 use super::dsp;
-use super::joc::{parse_ec3_extension_type_a, parse_joc_emdf, JocMetadata};
+use super::joc::{JocMetadata, parse_ec3_extension_type_a, parse_joc_emdf};
 
 /// E-AC-3 syncword — same value as base AC-3 (§E.2.2.1).
 // internal — exposed for tests/fuzz; not part of the stable API
@@ -121,6 +121,24 @@ pub struct Eac3DecoderState {
 }
 
 impl Eac3DecoderState {
+    /// Re-seed the decoder-private pseudo-random generators — the
+    /// §7.3.4 zero-bit dither and the §E.3.6.4.2 SPX noise — of both
+    /// substream states. The spec leaves these sequences to the decoder
+    /// ("any reasonably random sequence"), so two decodes of one stream
+    /// under different seeds differ exactly by that noise: conformance
+    /// harnesses use the pair to measure the decoder-private noise
+    /// ceiling of a stream before comparing against another decoder.
+    /// `seed == 0` is mapped to a fixed non-zero value (both generators
+    /// stall on an all-zero state).
+    #[doc(hidden)]
+    pub fn reseed_noise(&mut self, seed: u32) {
+        let s = if seed == 0 { 0x6D2B_79F5 } else { seed };
+        for st in [&mut self.indep_state, &mut self.dep_state] {
+            st.dither_lfsr_state = s;
+            st.spx_noise_lfsr = s.rotate_left(16) | 1;
+        }
+    }
+
     /// Read-only view of the indep substream's per-frame interleaved
     /// f32 PCM (range -1..1). After [`decode_eac3_packet`] this is the
     /// indep substream's PCM in `(acmod, lfeon)` bitstream order; if
@@ -228,10 +246,22 @@ impl Eac3DecoderState {
 /// Snapshot of the most recent independent substream's output shape
 /// — channels, sample rate, samples per frame.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct IndepProgramShape {
     pub nchans: u16,
     pub sample_rate: u32,
     pub samples_per_frame: u32,
+}
+
+impl IndepProgramShape {
+    /// Build a [`IndepProgramShape`] from every field.
+    pub fn new(nchans: u16, sample_rate: u32, samples_per_frame: u32) -> Self {
+        Self {
+            nchans,
+            sample_rate,
+            samples_per_frame,
+        }
+    }
 }
 
 /// Result of decoding one E-AC-3 packet.
@@ -373,10 +403,10 @@ pub fn decode_eac3_packet(state: &mut Eac3DecoderState, data: &[u8]) -> Result<D
                 // Round 3: decode + splice into indep_pcm_f32. On
                 // failure (Unsupported / parse error) we keep the
                 // indep PCM as-is so output is still meaningful.
-                if decode_dep_substream(state, &bsi, &audfrm, &mut br).is_ok() {
-                    if let Some(metadata) = decode_substream_joc(&bsi, &state.skip_fields) {
-                        joc_metadata = Some(metadata);
-                    }
+                if decode_dep_substream(state, &bsi, &audfrm, &mut br).is_ok()
+                    && let Some(metadata) = decode_substream_joc(&bsi, &state.skip_fields)
+                {
+                    joc_metadata = Some(metadata);
                 }
             }
             StreamType::Reserved => {
@@ -697,14 +727,14 @@ fn splice_dep_into_indep(
     state.indep_locations.extend(extend_locs.iter().copied());
 
     // Diagnostic: log the chanmap for any future bug hunts.
-    if let Some(map) = chanmap {
-        if std::env::var("EAC3_TRACE_CHANMAP").is_ok() {
-            eprintln!(
-                "TRACE-CHANMAP dep substream: chanmap=0x{map:04X} dep_nchans={dep_nchans} \
+    if let Some(map) = chanmap
+        && crate::audblk::debug_env("EAC3_TRACE_CHANMAP").is_some()
+    {
+        eprintln!(
+            "TRACE-CHANMAP dep substream: chanmap=0x{map:04X} dep_nchans={dep_nchans} \
                  replaced={} extended={num_extend} → indep grown to {new_nchans} channels",
-                dep_nchans - num_extend,
-            );
-        }
+            dep_nchans - num_extend,
+        );
     }
 
     extend_locs

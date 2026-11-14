@@ -121,7 +121,7 @@ fn ffmpeg_decode(eac3_bytes: &[u8], channels: usize) -> Option<Vec<f32>> {
     let _ = fs::remove_file(&in_path);
     let _ = fs::remove_file(&out_path);
     let mut out = Vec::with_capacity(bytes.len() / 2);
-    for c in bytes.chunks_exact(2) {
+    for c in bytes.as_chunks::<2>().0 {
         let v = i16::from_le_bytes([c[0], c[1]]) as f32 / 32768.0;
         out.push(v);
     }
@@ -593,7 +593,7 @@ fn eac3_71_pair_decodes_through_ffmpeg() {
 #[test]
 fn eac3_71_decoder_surfaces_chanmap_lrs_rrs() {
     use oxideav_ac3::eac3::chanmap::ChannelLocation;
-    use oxideav_ac3::eac3::decoder::{decode_eac3_packet, Eac3DecoderState};
+    use oxideav_ac3::eac3::decoder::{Eac3DecoderState, decode_eac3_packet};
 
     let pcm = build_sine_pcm_71();
     let bytes = encode_eac3(&pcm, 8, 576_000);
@@ -845,10 +845,8 @@ fn eac3_spx_atten_band_energy_through_ffmpeg() {
     // placement (a mis-sized field would desynchronise everything
     // after it) and (b) that the notch-compensated coordinates still
     // deliver the §3.6.4.3 banded energy.
-    let spx = SpxParams {
-        atten_code: Some(14), // Table E3.14 taps [0.5, 0.25, 0.125]
-        ..SpxParams::default()
-    };
+    // Table E3.14 taps [0.5, 0.25, 0.125]
+    let spx = SpxParams::default().with_atten_code(Some(14));
     let geom = SpxGeometry::derive(&spx, &oxideav_ac3::eac3::dsp::DEFAULT_SPX_BNDSTRC)
         .expect("SPX geometry");
     let pcm = build_spx_multitone(2);
@@ -1022,10 +1020,7 @@ fn eac3_spx_mixed_membership_through_ffmpeg() {
     // the chinspx[ch] = 0 arm: the non-SPX channel must keep its
     // chbwcod, its longer exponent set, and its own mantissa run —
     // one mis-gated field desynchronises the whole frame.
-    let spx = SpxParams {
-        channel_mask: Some(0b01),
-        ..SpxParams::default()
-    };
+    let spx = SpxParams::default().with_channel_mask(Some(0b01));
     let geom = SpxGeometry::derive(&spx, &oxideav_ac3::eac3::dsp::DEFAULT_SPX_BNDSTRC)
         .expect("SPX geometry");
     let pcm = build_spx_multitone(2);

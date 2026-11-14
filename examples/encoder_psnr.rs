@@ -142,7 +142,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // planar float: plane 0 is L, plane 1 is R
             let plane = |i: usize| {
                 a.data[i]
-                    .chunks_exact(4)
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
                     .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             };
             dec_l.extend(plane(0));
@@ -157,7 +159,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let skip = 2048usize.min(dec_l.len().saturating_sub(1));
     let best_lag: i32 = 256;
     let _ = (dec_r.len(),); // silence unused-var for early exits
-                            // Full-length PSNR using best_lag.
+    // Full-length PSNR using best_lag.
     let usable = l
         .len()
         .saturating_sub(skip)
